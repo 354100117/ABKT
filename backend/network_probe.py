@@ -261,9 +261,8 @@ class NetworkProbeClient:
             rtt = self._rtt_ewma.value if self._rtt_ewma.valid else 0.0
             state = self._state_machine.state
             # Budget: target transfer time × effective bandwidth
+            # No cap — allocator handles budget >= total_fp16 by using FP16
             budget = bw * TARGET_TRANSFER_TIME
-            if total_bytes > 0:
-                budget = min(budget, total_bytes)  # never exceed original size
         return NetworkSnapshot(
             timestamp=time.time(),
             bandwidth_bps=bw,
