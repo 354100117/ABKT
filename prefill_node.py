@@ -33,7 +33,7 @@ import torch
 from pd_inference.config import PDConfig
 from pd_inference.kv_cache import KVCache, kv_cache_fingerprint
 from pd_inference.model import PrefillStage
-from pd_inference.socket_transport import SocketClient
+from pd_inference.socket_transport import SocketClient, send_obj as _send_obj
 from pd_inference.utils import (
     encode_prompt,
     load_tokenizer,
@@ -47,25 +47,33 @@ from backend.chunked_transfer import ChunkedSender
 
 
 def _progress_bar(prefix: str):
-    """Return a callback(bytes_sent, total_bytes) that prints a live progress bar."""
-    state = {"last_print": 0.0}
+    """Return a callback(bytes_sent, total_bytes) that prints progress updates."""
+    state = {"last_print": 0.0, "last_pct": -1}
 
     def _update(sent: int, total: int):
         now = time.time()
-        if now - state["last_print"] < 0.1 and sent < total:
+        pct = int(sent / total * 100) if total > 0 else 0
+        # Print at ~25% intervals or every 2s
+        milestone = pct >= state["last_pct"] + 25 or pct >= 100
+        timed = now - state["last_print"] >= 2.0 and sent < total
+        if not milestone and not timed:
             return
         state["last_print"] = now
-        pct = sent / total * 100 if total > 0 else 0
+        state["last_pct"] = pct
         bar_w = 30
         filled = int(bar_w * sent / total) if total > 0 else 0
         bar = "█" * filled + "░" * (bar_w - filled)
-        sys.stdout.write(
-            f"\r  {prefix} |{bar}| {pct:5.1f}%  "
-            f"{sent/1e6:.2f}/{total/1e6:.2f} MB"
-        )
-        sys.stdout.flush()
-        if sent >= total:
-            sys.stdout.write("\n")
+        elapsed = now - state.get("t_start", now)
+        speed = sent / elapsed / 1e6 if elapsed > 0 else 0
+        print(f"  {prefix} |{bar}| {pct:3d}%  "
+              f"{sent/1e6:.2f}/{total/1e6:.2f} MB  "
+              f"{speed:.1f} MB/s")
+
+    def _start():
+        state["t_start"] = time.time()
+        state["last_pct"] = 0
+        total_mb = 0  # will be set on first _update call
+        print(f"  {prefix} starting...")
 
     return _update
 
@@ -203,22 +211,34 @@ def run_prefill_turn(
         if allocation.compression_ratio == 1.0:
             print("[prefill] Budget ample, using legacy FP16 transfer...")
             kv_data = kv_cache.to_transport_dict()
+
+            # Two-step protocol: send KV → ack → send params → result
+            # Step 1: Send KV cache, wait for ack (= real KV transfer time)
             t_kv_send = time.time()
             client.send_with_progress(
                 "run_decode",
                 on_progress=_progress_bar("KV send "),
                 kv_cache=kv_data,
-                input_ids=input_ids_t[0].tolist(),
-                first_token=first_token,
-                max_new_tokens=config.max_new_tokens,
-                repetition_penalty=config.repetition_penalty,
-                do_sample=config.do_sample,
-                temperature=config.temperature,
-                top_k=config.top_k,
-                top_p=config.top_p,
+                input_ids=None,   # signals two-step protocol
             )
+            ack = client.recv_obj()  # wait for {"ok": True, "result": {"ack": "kv_received"}}
             kv_send_time = time.time() - t_kv_send
-            print(f"[prefill] KV sent in {kv_send_time:.2f}s, waiting for decode...")
+            kv_bytes = len(str(kv_data).encode())  # rough estimate for display
+            print(f"[prefill] KV transferred in {kv_send_time:.2f}s")
+
+            # Step 2: Send decode parameters directly on the socket
+            # (decode handler is blocked on recv_obj, expects raw object)
+            print(f"[prefill] Sending decode params...")
+            _send_obj(client._sock, {
+                "input_ids": input_ids_t[0].tolist(),
+                "first_token": first_token,
+                "max_new_tokens": config.max_new_tokens,
+                "repetition_penalty": config.repetition_penalty,
+                "do_sample": config.do_sample,
+                "temperature": config.temperature,
+                "top_k": config.top_k,
+                "top_p": config.top_p,
+            })
             result = client.recv_obj()
             send_time = time.time() - t_send
         else:

@@ -314,17 +314,26 @@ def parse_result(output: str, scenario: str = "") -> TransferResult:
             r.abkt_compression = float(m.group(2))
             r.abkt_bytes = float(m.group(3))
 
-        # 解码速度
+        # 解码速度 (from decode_node output)
         m = re.search(r"(\d+)\s+tokens?\s+in\s+([\d.]+)s\s+\(([\d.]+)\s+tok/s", line)
         if m:
             r.num_tokens = int(m.group(1))
             r.decode_time = float(m.group(2))
             r.tok_per_sec = float(m.group(3))
 
+        # 解码信息 (from result dict: 'num_tokens': N, 'time': X.XX)
+        m = re.search(r"'num_tokens':\s*(\d+)", line)
+        if m:
+            r.num_tokens = int(m.group(1))
+        m = re.search(r"'time':\s*([\d.]+)", line)
+        if m:
+            r.decode_time = float(m.group(1))
+
         # 传输总时间 (支持新旧两种格式)
         m = re.search(r"KV transfer: ([\d.]+)s, decode: ([\d.]+)s, total: ([\d.]+)s", line)
         if m:
             r.chunk_send_time = float(m.group(1))  # KV-only transfer time
+            r.decode_time = float(m.group(2))       # decode time from report
             r.total_time = float(m.group(3))
         else:
             m = re.search(r"Transfer complete in ([\d.]+)s", line)
@@ -355,6 +364,10 @@ def parse_result(output: str, scenario: str = "") -> TransferResult:
 
 def print_result(result: TransferResult) -> None:
     """格式化打印结果。"""
+    # Auto-calculate tok_per_sec if not set
+    if result.tok_per_sec == 0 and result.num_tokens > 0 and result.decode_time > 0:
+        result.tok_per_sec = result.num_tokens / result.decode_time
+
     print(f"\n{'─' * 60}")
     print(f"  场景: {result.scenario}")
     print(f"{'─' * 60}")

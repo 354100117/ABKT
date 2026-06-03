@@ -36,7 +36,7 @@ from transformers.cache_utils import DynamicCache
 
 from pd_inference.config import PDConfig
 from pd_inference.kv_cache import KVCache, dynamic_cache_fingerprint
-from pd_inference.socket_transport import SocketServer
+from pd_inference.socket_transport import SocketServer, send_obj, recv_obj
 from pd_inference.utils import decode_tokens, load_tokenizer, get_device
 from backend.network_probe import ProbeServer
 from backend.chunked_transfer import ChunkAssembler
@@ -151,6 +151,7 @@ def main():
         temperature=1.0,
         top_k=0,
         top_p=1.0,
+        _client_socket=None,
     ):
         req_id = _request_counter[0]
         _request_counter[0] += 1
@@ -170,6 +171,25 @@ def main():
 
         # ── Diagnostic: verify DynamicCache reconstruction ──
         print(dynamic_cache_fingerprint(dcache))
+
+        # Two-step protocol: if input_ids is None, send ack and wait for params
+        if input_ids is None and _client_socket is not None:
+            print(f"[decode] Two-step mode: sending KV ack...")
+            send_obj(_client_socket, {"ok": True, "result": {"ack": "kv_received"}})
+            print(f"[decode] Waiting for decode params...")
+            params = recv_obj(_client_socket)
+            if not isinstance(params, dict):
+                return {"generated_text": "[ERROR] Invalid params", "generated_ids": [], "num_tokens": 0, "time": 0}
+            input_ids = params.get("input_ids", [])
+            first_token = params.get("first_token")
+            max_new_tokens = params.get("max_new_tokens", 128)
+            repetition_penalty = params.get("repetition_penalty", 1.0)
+            do_sample = params.get("do_sample", False)
+            temperature = params.get("temperature", 1.0)
+            top_k = params.get("top_k", 0)
+            top_p = params.get("top_p", 1.0)
+            print(f"[decode] Params received: {max_new_tokens} tokens, "
+                  f"{'sample' if do_sample else 'greedy'}")
 
         # Step 2: Autoregressive decode loop using model.forward()
         sample_cfg = ""
@@ -315,6 +335,7 @@ def main():
         request_id, input_ids, first_token=None, max_new_tokens=128,
         repetition_penalty=1.0, do_sample=False, temperature=1.0,
         top_k=0, top_p=1.0, num_layers=32, seq_len=0, q_metadata=None,
+        _client_socket=None,
     ):
         """Init ABKT chunked transfer: returns stream context for SocketServer."""
         req_id = _request_counter[0]

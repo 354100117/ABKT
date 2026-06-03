@@ -192,7 +192,7 @@ class SocketServer:
                 continue
 
             try:
-                result = handler(**payload)
+                result = handler(**payload, _client_socket=self._client)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
