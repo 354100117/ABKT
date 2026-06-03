@@ -65,6 +65,7 @@ class ChunkedSender:
         importance_map: Dict,
         bandwidth_bps: float,
         request_id: str,
+        on_progress: "Callable[[int, int], None] | None" = None,
     ) -> None:
         """Send all layers in importance order, with mid-transfer adaptation."""
         chunk_size = self._adaptive_chunk_size(bandwidth_bps)
@@ -72,6 +73,15 @@ class ChunkedSender:
         total_chunks = 0
         total_bytes = 0
         t_start = time.time()
+
+        # Pre-calculate total expected bytes for progress tracking
+        total_expected = 0
+        for dnode in quantized_kv:
+            for lidx in layer_order:
+                kv = quantized_kv[dnode].get(lidx)
+                if kv is not None:
+                    k, v = kv
+                    total_expected += k.nbytes + v.nbytes
 
         # Track which layers have been sent vs are still pending
         sent_layers = set()
@@ -97,9 +107,10 @@ class ChunkedSender:
                     chunk_bytes = k_chunk.nbytes + v_chunk.nbytes
                     total_bytes += chunk_bytes
                     total_chunks += 1
-                    print(f"[sender] chunk #{total_chunks} layer={lidx} "
-                          f"[{start}:{end}] {chunk_bytes/1024:.1f}KB "
-                          f"last={end >= seq_len}")
+                    if total_chunks % 10 == 0 or end >= seq_len:
+                        print(f"[sender] chunk #{total_chunks} layer={lidx} "
+                              f"[{start}:{end}] {chunk_bytes/1024:.1f}KB "
+                              f"last={end >= seq_len}")
                     self.send_fn({
                         "request_id": request_id,
                         "layer_idx": lidx,
@@ -111,6 +122,8 @@ class ChunkedSender:
                         "meta": meta,
                         "is_last_chunk": (end >= seq_len),
                     })
+                    if on_progress is not None:
+                        on_progress(total_bytes, total_expected)
 
                     # ── Mid-transfer bandwidth check ──
                     if (total_chunks % TIMING_CHECK_INTERVAL == 0

@@ -46,6 +46,30 @@ from backend.adaptive_quant import AdaptiveQuantizer
 from backend.chunked_transfer import ChunkedSender
 
 
+def _progress_bar(prefix: str):
+    """Return a callback(bytes_sent, total_bytes) that prints a live progress bar."""
+    state = {"last_print": 0.0}
+
+    def _update(sent: int, total: int):
+        now = time.time()
+        if now - state["last_print"] < 0.1 and sent < total:
+            return
+        state["last_print"] = now
+        pct = sent / total * 100 if total > 0 else 0
+        bar_w = 30
+        filled = int(bar_w * sent / total) if total > 0 else 0
+        bar = "█" * filled + "░" * (bar_w - filled)
+        sys.stdout.write(
+            f"\r  {prefix} |{bar}| {pct:5.1f}%  "
+            f"{sent/1e6:.2f}/{total/1e6:.2f} MB"
+        )
+        sys.stdout.flush()
+        if sent >= total:
+            sys.stdout.write("\n")
+
+    return _update
+
+
 # ════════════════════════════════════════════════════════════════════
 # 核心: 单轮推理
 # ════════════════════════════════════════════════════════════════════
@@ -178,9 +202,12 @@ def run_prefill_turn(
 
         if allocation.compression_ratio == 1.0:
             print("[prefill] Budget ample, using legacy FP16 transfer...")
-            result = client.call(
+            kv_data = kv_cache.to_transport_dict()
+            t_kv_send = time.time()
+            client.send_with_progress(
                 "run_decode",
-                kv_cache=kv_cache.to_transport_dict(),
+                on_progress=_progress_bar("KV send "),
+                kv_cache=kv_data,
                 input_ids=input_ids_t[0].tolist(),
                 first_token=first_token,
                 max_new_tokens=config.max_new_tokens,
@@ -190,6 +217,9 @@ def run_prefill_turn(
                 top_k=config.top_k,
                 top_p=config.top_p,
             )
+            kv_send_time = time.time() - t_kv_send
+            print(f"[prefill] KV sent in {kv_send_time:.2f}s, waiting for decode...")
+            result = client.recv_obj()
             send_time = time.time() - t_send
         else:
             request_id = f"req_{int(time.time() * 1000)}"
@@ -227,8 +257,10 @@ def run_prefill_turn(
                 precision_map=allocation.precision_map,
             )
             sender.send_all(quantized_kv, q_metadata, importance_map,
-                            snapshot.bandwidth_bps, request_id)
-            print(f"[prefill] ABKT: All chunks sent in {time.time() - t_chunks:.3f}s")
+                            snapshot.bandwidth_bps, request_id,
+                            on_progress=_progress_bar("KV send "))
+            chunk_send_time = time.time() - t_chunks
+            print(f"[prefill] ABKT: All chunks sent in {chunk_send_time:.3f}s")
             probe.resume_bw_probes()
 
             print(f"[prefill] ABKT: Sending decode_start...")
@@ -244,12 +276,17 @@ def run_prefill_turn(
             compression_ratio=allocation.compression_ratio,
         )
 
-        # Estimate KV-only transfer time (total minus decode)
         decode_time_est = result.get("time", 0) if isinstance(result, dict) else 0
-        kv_transfer_time = max(send_time - decode_time_est, 0)
-        print(f"[prefill] KV transfer: {kv_transfer_time:.2f}s, "
-              f"decode: {decode_time_est:.2f}s, "
-              f"total: {send_time:.2f}s")
+        if allocation.compression_ratio == 1.0:
+            # Legacy path: kv_send_time is directly measured
+            print(f"[prefill] KV transfer: {kv_send_time:.2f}s, "
+                  f"decode: {decode_time_est:.2f}s, "
+                  f"total: {send_time:.2f}s")
+        else:
+            # ABKT path: chunk_send_time is directly measured
+            print(f"[prefill] KV transfer: {chunk_send_time:.2f}s, "
+                  f"decode: {decode_time_est:.2f}s, "
+                  f"total: {send_time:.2f}s")
 
     except Exception as e:
         print(f"[ERROR] Prefill failed: {e}")

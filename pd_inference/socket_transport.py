@@ -49,6 +49,43 @@ def send_obj(sock: socket.socket, obj: Any) -> None:
     sock.sendall(header + data)
 
 
+# Progress bar chunk size: 64 KB
+_PROGRESS_CHUNK = 64 * 1024
+
+
+def send_obj_progress(
+    sock: socket.socket,
+    obj: Any,
+    on_progress: "Callable[[int, int], None] | None" = None,
+) -> int:
+    """Send a Python object with optional progress callback.
+
+    Args:
+        sock: Socket to send on
+        obj: Object to serialize and send
+        on_progress: callback(bytes_sent, total_bytes) called after each chunk
+
+    Returns:
+        Total bytes sent (including 4-byte header)
+    """
+    buf = io.BytesIO()
+    torch.save(obj, buf)
+    data = buf.getvalue()
+    total = len(data)
+    header = struct.pack("!I", total)
+    sock.sendall(header)
+
+    sent = 0
+    while sent < total:
+        end = min(sent + _PROGRESS_CHUNK, total)
+        sock.sendall(data[sent:end])
+        sent = end
+        if on_progress is not None:
+            on_progress(sent, total)
+
+    return total + 4
+
+
 def recv_obj(sock: socket.socket) -> Any:
     """Receive a Python object from a socket.
 
@@ -338,6 +375,24 @@ class SocketClient:
             raise RuntimeError("Not connected. Call connect() first.")
         msg = obj if isinstance(obj, dict) and "op" in obj else {"op": "raw", "payload": obj}
         send_obj(self._sock, msg)
+
+    def send_with_progress(
+        self, op: str, on_progress: "Callable[[int, int], None] | None" = None, **payload
+    ) -> int:
+        """Send a request with progress tracking (no response wait).
+
+        Args:
+            op: Operation name
+            on_progress: callback(bytes_sent, total_bytes) for progress display
+            **payload: Operation arguments
+
+        Returns:
+            Total bytes sent
+        """
+        if self._sock is None:
+            raise RuntimeError("Not connected. Call connect() first.")
+        msg = {"op": op, "payload": payload}
+        return send_obj_progress(self._sock, msg, on_progress=on_progress)
 
     def recv_obj(self) -> Any:
         """Receive a single response from the socket (after streaming sends)."""
