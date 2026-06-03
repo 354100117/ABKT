@@ -311,11 +311,11 @@ def run_prefill_turn(
             # Legacy path: kv_send_time is directly measured
             print(f"[prefill] KV transfer: {kv_send_time:.2f}s, "
                   f"decode: {decode_time_est:.2f}s, "
-                  f"total: {send_time:.2f}s")
+                  f"total: {send_time:.2f}s", flush=True)
         else:
             # ABKT path: chunk_send_time is directly measured
             print(f"[prefill] KV transfer: {chunk_send_time:.2f}s, "
-                  f"decode: {decode_time_est:.2f}s, "
+                  f"decode: {decode_time_est:.2f}s,"
                   f"total: {send_time:.2f}s")
 
     except Exception as e:
@@ -357,14 +357,16 @@ def run_single_shot(config, prefill_stage, tokenizer, probe, num_layers):
     num_tokens = result.get("num_tokens", 0)
     total_time = result.get("time", 0)
 
-    print(f"\n{'=' * 60}")
-    print(f" [RESULT] Generated text:")
-    print(f"{'=' * 60}")
-    print(generated_text)
-    print(f"{'=' * 60}")
+    print(f"\n{'=' * 60}", flush=True)
+    print(f" [RESULT] Generated text:", flush=True)
+    print(f"{'=' * 60}", flush=True)
+    print(generated_text, flush=True)
+    print(f"{'=' * 60}", flush=True)
     if num_tokens:
         print(f" Generated {num_tokens} tokens in {total_time:.1f}s "
-              f"({num_tokens / total_time:.1f} tok/s)")
+              f"({num_tokens / total_time:.1f} tok/s)", flush=True)
+    # Also print result dict for orchestrator parsing
+    print(f"[RESULT] {result}", flush=True)
 
     return result
 

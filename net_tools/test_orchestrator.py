@@ -340,14 +340,13 @@ def parse_result(output: str, scenario: str = "") -> TransferResult:
     """从 prefill_node.py 的 stdout 中解析结果。"""
     r = TransferResult(scenario=scenario, raw_output=output)
 
-    # 提取 generated_text from result dict (most reliable)
-    # The text is the last field in the dict, ending with '}
-    gt_match = re.search(
-        r"'generated_text':\s*'(.*?)'\s*,\s*'num_tokens'",
-        output, re.DOTALL
-    )
-    if gt_match:
-        r.generated_text = gt_match.group(1).replace("\\n", "\n").strip()
+    # 提取 generated_text from [RESULT] dict line (most reliable)
+    result_dict_match = re.search(r"\[RESULT\]\s*(\{.*\})", output)
+    if result_dict_match:
+        dict_str = result_dict_match.group(1)
+        gt = re.search(r"'generated_text':\s*'(.*?)'\s*'", dict_str, re.DOTALL)
+        if gt:
+            r.generated_text = gt.group(1).replace("\\n", "\n").strip()
 
     # Fallback: 提取 [RESULT] 和 === 之间的内容
     if not r.generated_text:
@@ -357,7 +356,6 @@ def parse_result(output: str, scenario: str = "") -> TransferResult:
         )
         if result_match:
             raw = result_match.group(1).strip()
-            # If it's a dict repr, try to extract generated_text
             inner = re.search(r"'generated_text':\s*'(.*?)'", raw, re.DOTALL)
             if inner:
                 r.generated_text = inner.group(1).replace("\\n", "\n").strip()
@@ -394,6 +392,13 @@ def parse_result(output: str, scenario: str = "") -> TransferResult:
         # ABKT DECISION 诊断行
         if "ABKT DECISION" in line_s:
             r.abkt_decision = line_s
+
+        # Generated N tokens in Xs (Y tok/s) — from prefill result section
+        m = re.search(r"Generated (\d+) tokens in ([\d.]+)s \(([\d.]+) tok/s", line_s)
+        if m:
+            r.num_tokens = int(m.group(1))
+            r.decode_time = float(m.group(2))
+            r.tok_per_sec = float(m.group(3))
 
         # 解码速度 (from decode_node output)
         m = re.search(r"(\d+)\s+tokens?\s+in\s+([\d.]+)s\s+\(([\d.]+)\s+tok/s", line_s)
