@@ -1,0 +1,44 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Model files (too large)
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Logs and results
+*.log
+test_results_*.json
+*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+.codegraph/
+.pytest_cache/
+
+# Compiled
+*.so
+*.o

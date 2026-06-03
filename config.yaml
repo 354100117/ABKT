@@ -1,0 +1,18 @@
+# EdgePD Configuration
+# PD-separated LLM inference with two nodes
+
+model:
+  name_or_path: "/ssd/models/opt-2.7b-safetensors"
+  dtype: "float16"
+
+distributed:
+  master_addr: "192.168.0.50"
+  master_port: 29500
+
+# layer_split: 12     # OPT-2.7B: 0-11 on prefill, 12-23 on decode
+# If omitted, both nodes load all layers (simple pipeline parallelism)
+
+inference:
+  max_context_tokens: 2048
+  default_max_new_tokens: 128
+  repetition_penalty: 1.0
