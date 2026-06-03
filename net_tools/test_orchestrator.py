@@ -77,9 +77,11 @@ class TestScenario:
     model_override: str = ""        # 覆盖模型路径 (空=使用 --model)
 
 
-# 模型 KV cache 大小参考 (153 tokens):
-#   Qwen2.5-3B: ~5.6 MB  → 压缩阈值 bw < 22 Mbps
-#   OPT-2.7B:   ~48 MB   → 压缩阈值 bw < 192 Mbps
+# Qwen2.5-3B KV cache 大小参考 (173 tokens):
+#   ~6.4 MB FP16 → 压缩阈值 bw < 25.6 Mbps (budget = bw_mbps/8 * 2.0s)
+#
+# constant_low / constant_very_low: 全程受限，probe 测量受限带宽，ABKT 压缩
+# mid_drop: pre-tc 高带宽 → FP16 决策，传输中骤降 → sender 检测 BW drop 降级
 
 SCENARIOS = {
     "baseline": TestScenario(
@@ -90,30 +92,28 @@ SCENARIOS = {
 
     "constant_low": TestScenario(
         name="constant_low",
-        description="全程低带宽: 10 Mbps (Qwen2.5-3B 触发 ABKT)",
+        description="全程低带宽: 10 Mbps → ABKT 压缩",
         pre_tc_mbps=10,
     ),
 
     "constant_very_low": TestScenario(
         name="constant_very_low",
-        description="全程极低带宽: 2 Mbps",
+        description="全程极低带宽: 2 Mbps → 极端压缩",
         pre_tc_mbps=2,
     ),
 
     "mid_drop": TestScenario(
         name="mid_drop",
-        description="中途骤降: 300Mbps→传输中降至5Mbps (OPT-2.7B, ABKT 触发)",
-        pre_tc_mbps=300,       # probe 测 300Mbps → FP16 决策
-        transfer_tc_mbps=5,    # 传输中降到 5Mbps → 带宽骤降
-        model_override="/ssd/models/opt-2.7b",
+        description="中途骤降: 100→2 Mbps → FP16 再降级",
+        pre_tc_mbps=100,       # probe ~12.5 MB/s, budget=25 MB > 6.4 MB → FP16
+        transfer_tc_mbps=2,    # 传输中降到 2 Mbps → sender 检测 BW drop
     ),
 
     "mid_drop_severe": TestScenario(
         name="mid_drop_severe",
-        description="中途骤降 (严重): 300→1 Mbps (OPT-2.7B)",
-        pre_tc_mbps=300,
+        description="中途骤降 (严重): 100→1 Mbps",
+        pre_tc_mbps=100,
         transfer_tc_mbps=1,
-        model_override="/ssd/models/opt-2.7b",
     ),
 
     "gradual": TestScenario(
@@ -282,6 +282,30 @@ def verify_decode_node(host: str, port: int) -> bool:
         return False
 
 
+def restart_decode_node(host: str, model: str, port: int = DECODE_PORT,
+                        user: str = PREFILL_USER, timeout: int = 60) -> bool:
+    """重启 decode 节点，加载指定模型。"""
+    print(f"  [decode] 重启 decode 节点: {model} (port {port})...")
+    ssh_cmd(host, "pkill -f 'python3.*decode_node' 2>/dev/null || true", user=user)
+    time.sleep(1)
+
+    ssh_cmd(host,
+        f"nohup python3 /ssd/pd/ABKT/decode_node.py "
+        f"--model-name {model} --port {port} "
+        f"> /tmp/decode_node.log 2>&1 &",
+        user=user)
+
+    # 等待 decode 节点就绪
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if verify_decode_node(host, port):
+            print(f"  [decode] 就绪 ({time.time()-t0:.1f}s)")
+            return True
+        time.sleep(2)
+    print(f"  [decode] 超时 ({timeout}s)")
+    return False
+
+
 # ════════════════════════════════════════════════════════════════════
 # 结果解析
 # ════════════════════════════════════════════════════════════════════
@@ -316,18 +340,29 @@ def parse_result(output: str, scenario: str = "") -> TransferResult:
     """从 prefill_node.py 的 stdout 中解析结果。"""
     r = TransferResult(scenario=scenario, raw_output=output)
 
-    # 提取生成文本 (在 [RESULT] 和 === 之间的内容)
-    result_match = re.search(
-        r"\[RESULT\]\s*Generated text:\s*\n=+\s*\n(.*?)\n=+",
+    # 提取 generated_text from result dict (most reliable)
+    # The text is the last field in the dict, ending with '}
+    gt_match = re.search(
+        r"'generated_text':\s*'(.*?)'\s*,\s*'num_tokens'",
         output, re.DOTALL
     )
-    if result_match:
-        r.generated_text = result_match.group(1).strip()
+    if gt_match:
+        r.generated_text = gt_match.group(1).replace("\\n", "\n").strip()
 
-    # 提取 generated_text from result dict
-    gt_match = re.search(r"'generated_text':\s*'(.*?)'", output)
-    if gt_match and not r.generated_text:
-        r.generated_text = gt_match.group(1).strip()
+    # Fallback: 提取 [RESULT] 和 === 之间的内容
+    if not r.generated_text:
+        result_match = re.search(
+            r"\[RESULT\]\s*Generated text:\s*\n=+\s*\n(.*?)\n=+",
+            output, re.DOTALL
+        )
+        if result_match:
+            raw = result_match.group(1).strip()
+            # If it's a dict repr, try to extract generated_text
+            inner = re.search(r"'generated_text':\s*'(.*?)'", raw, re.DOTALL)
+            if inner:
+                r.generated_text = inner.group(1).replace("\\n", "\n").strip()
+            else:
+                r.generated_text = raw
 
     for line in output.split("\n"):
         line_s = line.strip()
@@ -529,9 +564,14 @@ def run_single_test(
     tc_clear(PREFILL_HOST)
     time.sleep(0.3)
 
-    # ── Step 2: 检查 decode 节点 ──
+    # ── Step 2: 检查/重启 decode 节点 ──
     print(f"  [2/5] 检查 decode 节点 {decode_host}:{decode_port}...")
-    if not verify_decode_node(decode_host, decode_port):
+    if scenario.model_override:
+        # 模型不同时需要重启 decode 节点
+        if not restart_decode_node(decode_host, actual_model, decode_port):
+            return TransferResult(scenario=scenario.name,
+                                  raw_output="ERROR: decode node restart failed")
+    elif not verify_decode_node(decode_host, decode_port):
         print(f"  [ERROR] decode 节点 {decode_host}:{decode_port} 未就绪!")
         print(f"          请先在 decode 节点运行: python3 {ABKT_DIR}/decode_node.py")
         return TransferResult(scenario=scenario.name,
@@ -656,29 +696,31 @@ def main():
         epilog="""
 场景说明:
   baseline           无限制 (对照组)
-  constant_low       全程 10 Mbps (Qwen2.5-3B 触发 ABKT)
-  constant_very_low  全程 2 Mbps
-  mid_drop           300→5 Mbps (OPT-2.7B, 中途骤降)
-  mid_drop_severe    300→1 Mbps (OPT-2.7B, 严重骤降)
+  constant_low       全程 10 Mbps → ABKT 压缩
+  constant_very_low  全程 2 Mbps → 极端压缩
+  mid_drop           100→2 Mbps (中途骤降)
+  mid_drop_severe    100→1 Mbps (严重骤降)
   gradual            50→10 Mbps
   with_delay         20 Mbps + 20ms 延迟
   with_loss          30 Mbps + 5% 丢包
   oscillating        50→5→50→5 Mbps (每 2s 振荡)
   custom             自定义 (需指定 --pre-tc / --transfer-tc)
 
-模型 KV cache 大小 (153 tokens):
-  Qwen2.5-3B: ~5.6 MB  → 压缩阈值 bw < 22 Mbps
-  OPT-2.7B:   ~48 MB   → 压缩阈值 bw < 192 Mbps
+Qwen2.5-3B KV cache (173 tokens): ~6.4 MB
+  压缩阈值: bw < 25.6 Mbps (budget = bw_mbps/8 * 2.0s)
 
 示例:
   # 基线测试:
   python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario baseline
 
-  # 中途骤降 (OPT-2.7B):
-  python3 test_orchestrator.py --model /ssd/models/opt-2.7b --scenario mid_drop
+  # 低带宽压缩:
+  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario constant_low
+
+  # 中途骤降:
+  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario mid_drop
 
   # 对比:
-  python3 test_orchestrator.py --model /ssd/models/opt-2.7b --compare baseline mid_drop
+  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --compare baseline constant_low
 
   # 自定义:
   python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario custom \\
