@@ -321,10 +321,15 @@ def parse_result(output: str, scenario: str = "") -> TransferResult:
             r.decode_time = float(m.group(2))
             r.tok_per_sec = float(m.group(3))
 
-        # 传输总时间
-        m = re.search(r"Transfer complete in ([\d.]+)s", line)
+        # 传输总时间 (支持新旧两种格式)
+        m = re.search(r"KV transfer: ([\d.]+)s, decode: ([\d.]+)s, total: ([\d.]+)s", line)
         if m:
-            r.total_time = float(m.group(1))
+            r.chunk_send_time = float(m.group(1))  # KV-only transfer time
+            r.total_time = float(m.group(3))
+        else:
+            m = re.search(r"Transfer complete in ([\d.]+)s", line)
+            if m:
+                r.total_time = float(m.group(1))
 
         # 层数
         m = re.search(r"num_layers[=:]\s*(\d+)", line)

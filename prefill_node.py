@@ -244,7 +244,12 @@ def run_prefill_turn(
             compression_ratio=allocation.compression_ratio,
         )
 
-        print(f"[prefill] Transfer complete in {send_time:.2f}s")
+        # Estimate KV-only transfer time (total minus decode)
+        decode_time_est = result.get("time", 0) if isinstance(result, dict) else 0
+        kv_transfer_time = max(send_time - decode_time_est, 0)
+        print(f"[prefill] KV transfer: {kv_transfer_time:.2f}s, "
+              f"decode: {decode_time_est:.2f}s, "
+              f"total: {send_time:.2f}s")
 
     except Exception as e:
         print(f"[ERROR] Prefill failed: {e}")
