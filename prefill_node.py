@@ -184,6 +184,7 @@ def run_prefill_turn(
                 abkt_kv[dnode].pop(lidx, None)
                 importance_map.get(dnode, {}).pop(lidx, None)
         num_layers -= len(dropped)
+        total_fp16 = PrecisionAllocator._total_bytes(abkt_kv, Precision.FP16)
         allocation = allocator.allocate(importance_map, abkt_kv, budget,
                                         num_layers_total=original_num_layers)
         print(f"[prefill] ABKT: After dropping — avg_bits={allocation.avg_precision_bits:.1f} "
@@ -307,6 +308,8 @@ def run_prefill_turn(
         )
 
         decode_time_est = result.get("time", 0) if isinstance(result, dict) else 0
+        print(f"[prefill] DEBUG: send_time={send_time:.3f}s, decode_time_est={decode_time_est:.3f}s, "
+              f"result_keys={list(result.keys()) if isinstance(result, dict) else type(result)}", flush=True)
         if allocation.compression_ratio == 1.0:
             # Legacy path: kv_send_time is directly measured
             print(f"[prefill] KV transfer: {kv_send_time:.2f}s, "
