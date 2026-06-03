@@ -307,19 +307,18 @@ def run_prefill_turn(
             compression_ratio=allocation.compression_ratio,
         )
 
+        # Unwrap {"ok": True, "result": {...}} if needed
+        if isinstance(result, dict) and "result" in result and "ok" in result:
+            result = result["result"]
         decode_time_est = result.get("time", 0) if isinstance(result, dict) else 0
-        print(f"[prefill] DEBUG: send_time={send_time:.3f}s, decode_time_est={decode_time_est:.3f}s, "
-              f"result_keys={list(result.keys()) if isinstance(result, dict) else type(result)}", flush=True)
         if allocation.compression_ratio == 1.0:
-            # Legacy path: kv_send_time is directly measured
             print(f"[prefill] KV transfer: {kv_send_time:.2f}s, "
                   f"decode: {decode_time_est:.2f}s, "
                   f"total: {send_time:.2f}s", flush=True)
         else:
-            # ABKT path: chunk_send_time is directly measured
             print(f"[prefill] KV transfer: {chunk_send_time:.2f}s, "
-                  f"decode: {decode_time_est:.2f}s,"
-                  f"total: {send_time:.2f}s")
+                  f"decode: {decode_time_est:.2f}s, "
+                  f"total: {send_time:.2f}s", flush=True)
 
     except Exception as e:
         print(f"[ERROR] Prefill failed: {e}")

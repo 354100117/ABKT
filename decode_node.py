@@ -317,7 +317,7 @@ def main():
 
         total_time = time.time() - t_start
         gen_tokens = len(generated) - len(input_ids)
-        generated_text = decode_tokens(tokenizer, generated)
+        generated_text = decode_tokens(tokenizer, generated[len(input_ids):])
         print(f"[decode] Request #{req_id} complete: "
               f"{gen_tokens} new tokens in {total_time:.2f}s "
               f"({gen_tokens / total_time:.1f} tok/s)")
@@ -443,7 +443,7 @@ def main():
 
             total_time = time.time() - t_start
             gen_tokens = len(generated) - len(input_ids)
-            text = decode_tokens(tokenizer, generated)
+            text = decode_tokens(tokenizer, generated[len(input_ids):])
             print(f"[decode] ABKT Request #{req_id} complete: "
                   f"{gen_tokens} tokens in {total_time:.2f}s "
                   f"({gen_tokens / total_time:.1f} tok/s)")
