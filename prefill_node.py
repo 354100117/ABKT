@@ -194,6 +194,16 @@ def run_prefill_turn(
           f"compression={allocation.compression_ratio:.1f}x "
           f"bytes={allocation.total_bytes/1e6:.1f} MB")
 
+    # ABKT DECISION diagnostic — shows exactly what ABKT decided and why
+    if allocation.compression_ratio > 1.0:
+        decision = "COMPRESSED"
+        reason = f"budget={budget/1e6:.1f}MB < fp16={total_fp16/1e6:.1f}MB"
+    else:
+        decision = "FP16"
+        reason = f"budget={budget/1e6:.1f}MB >= fp16={total_fp16/1e6:.1f}MB"
+    print(f"[prefill] ABKT DECISION: {decision} — {reason} "
+          f"(bw={snapshot.bandwidth_ewma/1e6:.1f} MB/s, state={snapshot.state.value})")
+
     # Step 5: Quantize
     quantizer = AdaptiveQuantizer()
     quantized_kv, q_metadata = quantizer.quantize(abkt_kv, allocation.precision_map)

@@ -1,38 +1,32 @@
 #!/usr/bin/env python3
 """ABKT 测试编排器 — 精确控制网络变化与 KV cache 传输的时序。
 
-解决的核心问题: tc 网络模拟和 ABKT 推理独立运行，很难让带宽变化
-恰好发生在 KV cache 传输过程中。
+核心设计: tc 规则在 prefill_node.py 启动前施加，确保 bandwidth probe
+测量到受限带宽，ABKT 做出正确的压缩决策。
 
 原理:
-  1. 通过 SSH 在 prefill 节点 (192.168.0.50) 上运行 prefill_node.py
-  2. 实时监控 prefill 的 stdout，检测 KV 传输的开始/结束
-  3. 在传输开始的瞬间通过 SSH 施加 tc 带宽限制
+  1. 在 prefill 节点 eno1 上施加 tc 带宽限制 (egress)
+  2. 启动 prefill_node.py — probe 测量受限带宽，ABKT 基于此决策
+  3. 监控 stdout，传输开始后可动态切换带宽 (mid_drop / oscillating)
   4. 传输结束后清除 tc 规则
   5. 收集并对比结果
 
-关键: tc 规则施加在 prefill 节点的 eno1 上 (egress)，直接限制
-KV cache 数据发往 decode 节点的带宽。
-
 用法:
-  # 基本测试 (中途骤降):
-  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b
+  # 基本测试:
+  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario baseline
 
-  # 指定场景:
-  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario mid_drop
-  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario constant_low
-  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario gradual
+  # 中途骤降 (OPT-2.7B 触发 ABKT):
+  python3 test_orchestrator.py --model /ssd/models/opt-2.7b --scenario mid_drop
+
+  # 对比测试:
+  python3 test_orchestrator.py --model /ssd/models/opt-2.7b --compare baseline mid_drop
+
+  # 全场景测试:
+  python3 test_orchestrator.py --model /ssd/models/opt-2.7b --all
 
   # 自定义带宽:
   python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario custom \\
-      --bw-before 100 --bw-during 5 --bw-after 100
-
-  # 完整 ABKT 测试 (含采样):
-  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b \\
-      --prompt "请详细解释量子计算的基本原理" --max-tokens 300 --sample
-
-  # 对比测试 (无网络限制):
-  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario baseline
+      --pre-tc 10 --transfer-tc 5
 """
 
 import argparse
@@ -41,6 +35,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -65,103 +60,88 @@ ABKT_DIR = "/ssd/pd/ABKT"
 
 @dataclass
 class TestScenario:
-    """测试场景配置。"""
+    """测试场景配置。
+
+    pre_tc_mbps: prefill 启动前施加的带宽 (Mbps), 0=不限制。
+                 这决定了 bandwidth probe 测量到的带宽和 ABKT 的压缩决策。
+    transfer_tc_mbps: KV 传输过程中切换到的带宽 (Mbps), 0=不变。
+                      用于 mid_drop 等场景，传输中动态降速。
+    """
     name: str
     description: str
-    # 传输前带宽 (Mbps), 0=不限制
-    bw_before_mbps: float = 0
-    # 传输中带宽 (Mbps), 0=不限制
-    bw_during_mbps: float = 0
-    # 传输后带宽 (Mbps), 0=不限制
-    bw_after_mbps: float = 0
-    # 延迟 (ms)
-    delay_ms: float = 0
-    # 丢包 (%)
-    loss_pct: float = 0
-    # 是否等待传输中再降速 (False=提前施加)
-    wait_for_transfer: bool = True
+    pre_tc_mbps: float = 0          # prefill 启动前施加
+    transfer_tc_mbps: float = 0     # 传输中切换到 (0=不变)
+    delay_ms: float = 0             # 延迟 (ms)
+    loss_pct: float = 0             # 丢包 (%)
+    oscillate: bool = False         # 是否振荡 (由 OscillationThread 控制)
+    model_override: str = ""        # 覆盖模型路径 (空=使用 --model)
 
+
+# 模型 KV cache 大小参考 (153 tokens):
+#   Qwen2.5-3B: ~5.6 MB  → 压缩阈值 bw < 22 Mbps
+#   OPT-2.7B:   ~48 MB   → 压缩阈值 bw < 192 Mbps
 
 SCENARIOS = {
     "baseline": TestScenario(
         name="baseline",
         description="无网络限制 (对照组)",
-        bw_before_mbps=0, bw_during_mbps=0, bw_after_mbps=0,
-        wait_for_transfer=False,
-    ),
-
-    "mid_drop": TestScenario(
-        name="mid_drop",
-        description="中途骤降: 正常→传输中降至 5Mbps→恢复",
-        bw_before_mbps=0,      # 不限速 (让 prefill 和 probe 正常运行)
-        bw_during_mbps=5,      # KV 传输时降到 5 Mbps
-        bw_after_mbps=0,       # 恢复
-        wait_for_transfer=True,  # 等传输开始再降速
-    ),
-
-    "mid_drop_severe": TestScenario(
-        name="mid_drop_severe",
-        description="中途骤降 (严重): 正常→传输中降至 1Mbps",
-        bw_before_mbps=0,
-        bw_during_mbps=1,
-        bw_after_mbps=0,
-        wait_for_transfer=True,
+        pre_tc_mbps=0,
     ),
 
     "constant_low": TestScenario(
         name="constant_low",
-        description="全程低带宽: 10 Mbps",
-        bw_before_mbps=10,
-        bw_during_mbps=10,
-        bw_after_mbps=10,
-        wait_for_transfer=False,
+        description="全程低带宽: 10 Mbps (Qwen2.5-3B 触发 ABKT)",
+        pre_tc_mbps=10,
     ),
 
     "constant_very_low": TestScenario(
         name="constant_very_low",
         description="全程极低带宽: 2 Mbps",
-        bw_before_mbps=2,
-        bw_during_mbps=2,
-        bw_after_mbps=2,
-        wait_for_transfer=False,
+        pre_tc_mbps=2,
+    ),
+
+    "mid_drop": TestScenario(
+        name="mid_drop",
+        description="中途骤降: 300Mbps→传输中降至5Mbps (OPT-2.7B, ABKT 触发)",
+        pre_tc_mbps=300,       # probe 测 300Mbps → FP16 决策
+        transfer_tc_mbps=5,    # 传输中降到 5Mbps → 带宽骤降
+        model_override="/ssd/models/opt-2.7b",
+    ),
+
+    "mid_drop_severe": TestScenario(
+        name="mid_drop_severe",
+        description="中途骤降 (严重): 300→1 Mbps (OPT-2.7B)",
+        pre_tc_mbps=300,
+        transfer_tc_mbps=1,
+        model_override="/ssd/models/opt-2.7b",
     ),
 
     "gradual": TestScenario(
         name="gradual",
-        description="渐进退化: 传输前 50→传输中 10→传输后恢复",
-        bw_before_mbps=50,
-        bw_during_mbps=10,
-        bw_after_mbps=0,
-        wait_for_transfer=True,
+        description="渐进退化: 50→10 Mbps",
+        pre_tc_mbps=50,
+        transfer_tc_mbps=10,
     ),
 
     "with_delay": TestScenario(
         name="with_delay",
         description="带宽+延迟: 20 Mbps + 20ms 延迟",
-        bw_before_mbps=0,
-        bw_during_mbps=20,
-        bw_after_mbps=0,
+        pre_tc_mbps=20,
         delay_ms=20,
-        wait_for_transfer=True,
     ),
 
     "with_loss": TestScenario(
         name="with_loss",
         description="带宽+丢包: 30 Mbps + 5% 丢包",
-        bw_before_mbps=0,
-        bw_during_mbps=30,
-        bw_after_mbps=0,
+        pre_tc_mbps=30,
         loss_pct=5,
-        wait_for_transfer=True,
     ),
 
     "oscillating": TestScenario(
         name="oscillating",
-        description="传输中振荡: 50→5→50→5 Mbps (每 2s 切换)",
-        bw_before_mbps=0,
-        bw_during_mbps=50,  # 初始值，实际由 oscillate 控制
-        bw_after_mbps=0,
-        wait_for_transfer=True,
+        description="振荡: 50→5→50→5 Mbps (每 2s 切换)",
+        pre_tc_mbps=50,
+        oscillate=True,
     ),
 }
 
@@ -185,11 +165,10 @@ def ssh_cmd(host: str, command: str, user: str = PREFILL_USER,
 def tc_apply(host: str, bw_mbps: float, delay_ms: float = 0,
              loss_pct: float = 0, iface: str = PREFILL_IFACE) -> bool:
     """在远程节点施加 tc 规则。"""
-    # 先清除
-    ssh_cmd(host, f"sudo tc qdisc del dev {iface} root 2>/dev/null || true")
+    tc_clear(host, iface)
 
     if bw_mbps <= 0 and delay_ms <= 0 and loss_pct <= 0:
-        return True  # 不需要限制
+        return True
 
     cmds = []
 
@@ -210,7 +189,6 @@ def tc_apply(host: str, bw_mbps: float, delay_ms: float = 0,
             cmds.append(f"sudo tc qdisc add dev {iface} parent 1:10 handle 10: "
                         f"netem {' '.join(netem_parts)}")
     elif delay_ms > 0 or loss_pct > 0:
-        # 无带宽限制，只有延迟/丢包
         netem_parts = []
         if delay_ms > 0:
             jitter = max(1, delay_ms * 0.2)
@@ -242,8 +220,66 @@ def tc_update_bw(host: str, bw_mbps: float, iface: str = PREFILL_IFACE) -> bool:
 
 def tc_clear(host: str, iface: str = PREFILL_IFACE) -> bool:
     """清除远程节点的所有 tc 规则。"""
-    r = ssh_cmd(host, f"sudo tc qdisc del dev {iface} root 2>/dev/null || true")
+    ssh_cmd(host, f"sudo tc qdisc del dev {iface} root 2>/dev/null || true")
     return True
+
+
+# ════════════════════════════════════════════════════════════════════
+# OscillationThread — 传输中振荡带宽
+# ════════════════════════════════════════════════════════════════════
+
+
+class OscillationThread(threading.Thread):
+    """在传输过程中周期性切换带宽。
+
+    用法:
+        osc = OscillationThread("192.168.0.50", 50, 5, interval=2.0)
+        osc.start()
+        # ... 传输进行中 ...
+        osc.stop()
+    """
+
+    def __init__(self, host: str, bw_high: float, bw_low: float,
+                 interval: float = 2.0, iface: str = PREFILL_IFACE):
+        super().__init__(daemon=True)
+        self.host = host
+        self.bw_high = bw_high
+        self.bw_low = bw_low
+        self.interval = interval
+        self.iface = iface
+        self._stop_event = threading.Event()
+        self.phase = 0
+
+    def run(self):
+        while not self._stop_event.is_set():
+            self._stop_event.wait(self.interval)
+            if self._stop_event.is_set():
+                break
+            self.phase += 1
+            new_bw = self.bw_low if self.phase % 2 == 1 else self.bw_high
+            print(f"\n  >>> 振荡: 切换到 {new_bw} Mbps (phase {self.phase})")
+            tc_update_bw(self.host, new_bw, self.iface)
+
+    def stop(self):
+        self._stop_event.set()
+
+
+# ════════════════════════════════════════════════════════════════════
+# verify_decode_node — 检查 decode 节点是否就绪
+# ════════════════════════════════════════════════════════════════════
+
+
+def verify_decode_node(host: str, port: int) -> bool:
+    """检查 decode 节点是否在监听。"""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect((host, port))
+        s.close()
+        return True
+    except (ConnectionRefusedError, socket.timeout, OSError):
+        return False
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -267,6 +303,7 @@ class TransferResult:
     abkt_compression: float = 0
     abkt_avg_bits: float = 0
     abkt_bytes: float = 0       # MB
+    abkt_decision: str = ""     # ABKT DECISION 诊断行
     num_layers: int = 0
     fp16_layers: int = 0
     fp8_layers: int = 0
@@ -287,66 +324,74 @@ def parse_result(output: str, scenario: str = "") -> TransferResult:
     if result_match:
         r.generated_text = result_match.group(1).strip()
 
+    # 提取 generated_text from result dict
+    gt_match = re.search(r"'generated_text':\s*'(.*?)'", output)
+    if gt_match and not r.generated_text:
+        r.generated_text = gt_match.group(1).strip()
+
     for line in output.split("\n"):
-        line = line.strip()
+        line_s = line.strip()
 
         # 预填充时间
-        m = re.search(r"Prefill complete in ([\d.]+)s", line)
+        m = re.search(r"Prefill complete in ([\d.]+)s", line_s)
         if m:
             r.prefill_time = float(m.group(1))
 
         # chunk 发送时间
-        m = re.search(r"All chunks sent in ([\d.]+)s", line)
+        m = re.search(r"All chunks sent in ([\d.]+)s", line_s)
         if m:
             r.chunk_send_time = float(m.group(1))
 
         # ABKT 状态
-        m = re.search(r"state=(\w+)\s+bw=([\d.]+)\s+MB/s\s+budget=([\d.]+)\s+MB", line)
+        m = re.search(r"state=(\w+)\s+bw=([\d.]+)\s+MB/s\s+budget=([\d.]+)\s+MB", line_s)
         if m:
             r.abkt_state = m.group(1)
             r.abkt_bw = float(m.group(2))
             r.abkt_budget = float(m.group(3))
 
         # ABKT 压缩信息
-        m = re.search(r"avg_bits=([\d.]+)\s+compression=([\d.]+)x\s+bytes=([\d.]+)\s+MB", line)
+        m = re.search(r"avg_bits=([\d.]+)\s+compression=([\d.]+)x\s+bytes=([\d.]+)\s+MB", line_s)
         if m:
             r.abkt_avg_bits = float(m.group(1))
             r.abkt_compression = float(m.group(2))
             r.abkt_bytes = float(m.group(3))
 
+        # ABKT DECISION 诊断行
+        if "ABKT DECISION" in line_s:
+            r.abkt_decision = line_s
+
         # 解码速度 (from decode_node output)
-        m = re.search(r"(\d+)\s+tokens?\s+in\s+([\d.]+)s\s+\(([\d.]+)\s+tok/s", line)
+        m = re.search(r"(\d+)\s+tokens?\s+in\s+([\d.]+)s\s+\(([\d.]+)\s+tok/s", line_s)
         if m:
             r.num_tokens = int(m.group(1))
             r.decode_time = float(m.group(2))
             r.tok_per_sec = float(m.group(3))
 
-        # 解码信息 (from result dict: 'num_tokens': N, 'time': X.XX)
-        m = re.search(r"'num_tokens':\s*(\d+)", line)
+        # 解码信息 (from result dict)
+        m = re.search(r"'num_tokens':\s*(\d+)", line_s)
         if m:
             r.num_tokens = int(m.group(1))
-        m = re.search(r"'time':\s*([\d.]+)", line)
+        m = re.search(r"'time':\s*([\d.]+)", line_s)
         if m:
             r.decode_time = float(m.group(1))
 
-        # 传输总时间 (支持新旧两种格式)
-        m = re.search(r"KV transfer: ([\d.]+)s, decode: ([\d.]+)s, total: ([\d.]+)s", line)
+        # 传输总时间
+        m = re.search(r"KV transfer: ([\d.]+)s, decode: ([\d.]+)s, total: ([\d.]+)s", line_s)
         if m:
-            r.chunk_send_time = float(m.group(1))  # KV-only transfer time
-            r.decode_time = float(m.group(2))       # decode time from report
+            r.chunk_send_time = float(m.group(1))
+            r.decode_time = float(m.group(2))
             r.total_time = float(m.group(3))
         else:
-            m = re.search(r"Transfer complete in ([\d.]+)s", line)
+            m = re.search(r"Transfer complete in ([\d.]+)s", line_s)
             if m:
                 r.total_time = float(m.group(1))
 
         # 层数
-        m = re.search(r"num_layers[=:]\s*(\d+)", line)
+        m = re.search(r"num_layers[=:]\s*(\d+)", line_s)
         if m:
             r.num_layers = int(m.group(1))
 
     # 从 chunk 大小推断精度分布
-    fp16 = len(re.findall(r"\d+KB\b.*last=", output))  # rough
     chunk_sizes = re.findall(r"(\d+\.\d+)KB", output)
     for sz in chunk_sizes:
         sz_f = float(sz)
@@ -364,7 +409,6 @@ def parse_result(output: str, scenario: str = "") -> TransferResult:
 
 def print_result(result: TransferResult) -> None:
     """格式化打印结果。"""
-    # Auto-calculate tok_per_sec if not set
     if result.tok_per_sec == 0 and result.num_tokens > 0 and result.decode_time > 0:
         result.tok_per_sec = result.num_tokens / result.decode_time
 
@@ -376,6 +420,8 @@ def print_result(result: TransferResult) -> None:
     print(f"  解码:        {result.decode_time:.1f}s  "
           f"({result.num_tokens} tokens, {result.tok_per_sec:.1f} tok/s)")
     print(f"  总传输:      {result.total_time:.2f}s")
+    if result.abkt_decision:
+        print(f"  {result.abkt_decision}")
     if result.abkt_state:
         print(f"  ABKT 状态:   {result.abkt_state}")
         print(f"  ABKT 带宽:   {result.abkt_bw:.1f} MB/s")
@@ -412,7 +458,7 @@ def print_comparison(baseline: Optional[TransferResult],
     print(f"  对比: baseline vs {test.scenario}")
     print(f"{'═' * 60}")
 
-    def _delta(a, b, unit="", lower_better=True):
+    def _delta(a, b, lower_better=True):
         if a == 0:
             return ""
         diff = (b - a) / a * 100
@@ -460,27 +506,47 @@ def run_single_test(
     decode_host: str = DECODE_HOST,
     decode_port: int = DECODE_PORT,
 ) -> TransferResult:
-    """运行单次 ABKT 测试，精确控制网络时序。"""
+    """运行单次 ABKT 测试。
+
+    关键: tc 规则在 prefill_node.py 启动前施加，确保 bandwidth probe
+    测量到受限带宽。
+    """
+
+    actual_model = scenario.model_override if scenario.model_override else model
 
     print(f"\n{'═' * 60}")
     print(f"  测试场景: {scenario.name}")
     print(f"  描述: {scenario.description}")
+    print(f"  模型: {actual_model}")
+    if scenario.pre_tc_mbps > 0:
+        print(f"  预施加带宽: {scenario.pre_tc_mbps} Mbps")
+    if scenario.transfer_tc_mbps > 0:
+        print(f"  传输中带宽: {scenario.transfer_tc_mbps} Mbps")
     print(f"{'═' * 60}")
 
-    # ── Step 0: 确保 prefill 节点无 tc 规则 ──
+    # ── Step 1: 清除旧 tc 规则 ──
     print("  [1/5] 清除 prefill 节点 tc 规则...")
     tc_clear(PREFILL_HOST)
-    time.sleep(0.5)
+    time.sleep(0.3)
 
-    # ── Step 1: 如果需要提前施加带宽限制 ──
-    if not scenario.wait_for_transfer and scenario.bw_before_mbps > 0:
-        print(f"  [2/5] 预施加带宽限制: {scenario.bw_before_mbps} Mbps")
-        tc_apply(PREFILL_HOST, scenario.bw_before_mbps,
+    # ── Step 2: 检查 decode 节点 ──
+    print(f"  [2/5] 检查 decode 节点 {decode_host}:{decode_port}...")
+    if not verify_decode_node(decode_host, decode_port):
+        print(f"  [ERROR] decode 节点 {decode_host}:{decode_port} 未就绪!")
+        print(f"          请先在 decode 节点运行: python3 {ABKT_DIR}/decode_node.py")
+        return TransferResult(scenario=scenario.name,
+                              raw_output="ERROR: decode node not ready")
+
+    # ── Step 3: 施加 tc 规则 (在 prefill 启动前!) ──
+    if scenario.pre_tc_mbps > 0 or scenario.delay_ms > 0 or scenario.loss_pct > 0:
+        print(f"  [3/5] 施加 tc: {scenario.pre_tc_mbps} Mbps"
+              f" + {scenario.delay_ms}ms delay + {scenario.loss_pct}% loss")
+        tc_apply(PREFILL_HOST, scenario.pre_tc_mbps,
                  scenario.delay_ms, scenario.loss_pct)
     else:
-        print("  [2/5] 无预限制 (等待传输开始)")
+        print("  [3/5] 无带宽限制")
 
-    # ── Step 2: 构建 prefill 命令 ──
+    # ── Step 4: 构建 prefill 命令 ──
     sample_args = ""
     if sample:
         sample_args = f" --do-sample --temperature {temperature}"
@@ -491,7 +557,7 @@ def run_single_test(
 
     cmd = (
         f"cd {ABKT_DIR} && python3 prefill_node.py"
-        f" --model-name {model}"
+        f" --model-name {actual_model}"
         f" --decode-host {decode_host}"
         f" --decode-port {decode_port}"
         f" --prompt '{prompt}'"
@@ -499,8 +565,8 @@ def run_single_test(
         f"{sample_args}"
     )
 
-    # ── Step 3: 启动 prefill，实时监控输出 ──
-    print(f"  [3/5] 启动 prefill 节点...")
+    # ── Step 5: 启动 prefill，实时监控输出 ──
+    print(f"  [4/5] 启动 prefill 节点...")
     print(f"  命令: {cmd[:80]}...")
 
     ssh_process = subprocess.Popen(
@@ -516,56 +582,48 @@ def run_single_test(
     output_lines = []
     transfer_started = False
     transfer_ended = False
-    oscillate_phase = 0
-    oscillate_timer = time.time()
+    oscillation_thread: Optional[OscillationThread] = None
 
     try:
         for line in iter(ssh_process.stdout.readline, ""):
             output_lines.append(line)
-            line_stripped = line.strip()
+            line_s = line.strip()
 
-            # 实时打印关键行 (跳过进度条和空行)
+            # 实时打印关键行
             skip_keywords = ["Loading weights", "Materializing", "it/s]",
                              "━", "╸", "| "]
-            if line_stripped and not any(kw in line_stripped for kw in skip_keywords):
-                print(f"  │ {line_stripped}")
+            if line_s and not any(kw in line_s for kw in skip_keywords):
+                print(f"  │ {line_s}")
 
             # ── 检测 KV 传输开始 ──
-            # ABKT 路径: "Starting chunked transfer"
-            # Legacy 路径: "Budget ample" 或 "using legacy FP16 transfer"
-            # 通用: "Connected to" (socket 连接建立 = 传输即将开始)
-            if ("Starting chunked transfer" in line_stripped
-                    or "using legacy FP16 transfer" in line_stripped
-                    or "Budget ample" in line_stripped
-                    or "Connected to" in line_stripped):
-                if not transfer_started and scenario.wait_for_transfer:
-                    transfer_started = True
-                    if scenario.bw_during_mbps > 0:
-                        print(f"\n  >>> 检测到传输开始! 施加带宽限制: "
-                              f"{scenario.bw_during_mbps} Mbps")
-                        tc_apply(PREFILL_HOST, scenario.bw_during_mbps,
-                                 scenario.delay_ms, scenario.loss_pct)
-                        oscillate_timer = time.time()
+            if not transfer_started and (
+                "Starting chunked transfer" in line_s
+                or "using legacy FP16 transfer" in line_s
+                or "Budget ample" in line_s
+            ):
+                transfer_started = True
+                print(f"\n  >>> 检测到传输开始!")
 
-            # ── 振荡场景: 传输中交替带宽 ──
-            if (scenario.name == "oscillating" and transfer_started
-                    and not transfer_ended):
-                if time.time() - oscillate_timer >= 2.0:
-                    oscillate_phase += 1
-                    new_bw = 50 if oscillate_phase % 2 == 0 else 5
-                    print(f"\n  >>> 振荡: 切换到 {new_bw} Mbps")
-                    tc_update_bw(PREFILL_HOST, new_bw)
-                    oscillate_timer = time.time()
+                # 施加传输中带宽限制
+                if scenario.transfer_tc_mbps > 0:
+                    print(f"  >>> 切换带宽: {scenario.transfer_tc_mbps} Mbps")
+                    tc_update_bw(PREFILL_HOST, scenario.transfer_tc_mbps)
+
+                # 启动振荡线程
+                if scenario.oscillate:
+                    oscillation_thread = OscillationThread(
+                        PREFILL_HOST, scenario.pre_tc_mbps, 5.0, interval=2.0
+                    )
+                    oscillation_thread.start()
 
             # ── 检测传输结束 ──
-            if "Transfer complete" in line_stripped:
+            if "Transfer complete" in line_s:
                 transfer_ended = True
-                if scenario.wait_for_transfer and scenario.bw_after_mbps > 0:
-                    print(f"\n  >>> 传输结束, 恢复带宽: {scenario.bw_after_mbps} Mbps")
-                    tc_apply(PREFILL_HOST, scenario.bw_after_mbps)
-                elif scenario.wait_for_transfer:
-                    print("\n  >>> 传输结束, 清除 tc 规则")
-                    tc_clear(PREFILL_HOST)
+                if oscillation_thread:
+                    oscillation_thread.stop()
+                    oscillation_thread = None
+                print("\n  >>> 传输结束, 清除 tc 规则")
+                tc_clear(PREFILL_HOST)
 
         ssh_process.wait()
 
@@ -573,10 +631,12 @@ def run_single_test(
         print("\n  [INTERRUPT] 中断测试...")
         ssh_process.kill()
     finally:
-        # 确保清除 tc 规则
+        if oscillation_thread:
+            oscillation_thread.stop()
         tc_clear(PREFILL_HOST)
 
-    # ── Step 4: 解析结果 ──
+    # ── 解析结果 ──
+    print(f"  [5/5] 解析结果...")
     full_output = "".join(output_lines)
     result = parse_result(full_output, scenario.name)
     print_result(result)
@@ -591,34 +651,38 @@ def run_single_test(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ABKT 测试编排器 — 精确控制网络变化与 KV 传输时序",
+        description="ABKT 测试编排器 — 在 prefill 启动前施加 tc，精确控制带宽",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 场景说明:
-  baseline          无限制 (对照组)
-  mid_drop          中途骤降: 正常→传输中 5Mbps→恢复
-  mid_drop_severe   中途骤降 (严重): 传输中 1Mbps
-  constant_low      全程 10 Mbps
-  constant_very_low 全程 2 Mbps
-  gradual           渐进退化: 50→10→恢复
-  with_delay        带宽+延迟: 20 Mbps + 20ms
-  with_loss         带宽+丢包: 30 Mbps + 5%
-  oscillating       传输中振荡: 50→5→50→5 (每2s)
-  custom            自定义 (需指定 --bw-during)
+  baseline           无限制 (对照组)
+  constant_low       全程 10 Mbps (Qwen2.5-3B 触发 ABKT)
+  constant_very_low  全程 2 Mbps
+  mid_drop           300→5 Mbps (OPT-2.7B, 中途骤降)
+  mid_drop_severe    300→1 Mbps (OPT-2.7B, 严重骤降)
+  gradual            50→10 Mbps
+  with_delay         20 Mbps + 20ms 延迟
+  with_loss          30 Mbps + 5% 丢包
+  oscillating        50→5→50→5 Mbps (每 2s 振荡)
+  custom             自定义 (需指定 --pre-tc / --transfer-tc)
+
+模型 KV cache 大小 (153 tokens):
+  Qwen2.5-3B: ~5.6 MB  → 压缩阈值 bw < 22 Mbps
+  OPT-2.7B:   ~48 MB   → 压缩阈值 bw < 192 Mbps
 
 示例:
-  # 中途骤降测试:
-  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario mid_drop
+  # 基线测试:
+  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario baseline
 
-  # 对比测试 (baseline vs mid_drop):
-  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --compare baseline mid_drop
+  # 中途骤降 (OPT-2.7B):
+  python3 test_orchestrator.py --model /ssd/models/opt-2.7b --scenario mid_drop
 
-  # 自定义带宽:
+  # 对比:
+  python3 test_orchestrator.py --model /ssd/models/opt-2.7b --compare baseline mid_drop
+
+  # 自定义:
   python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario custom \\
-      --bw-during 3
-
-  # 完整测试 (所有场景):
-  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --all
+      --pre-tc 10 --transfer-tc 5
 """,
     )
 
@@ -631,7 +695,7 @@ def main():
     parser.add_argument("--all", action="store_true",
                         help="运行所有场景并对比")
     parser.add_argument("--prompt", default=None,
-                        help="输入 prompt (默认使用内置长 prompt)")
+                        help="输入 prompt")
     parser.add_argument("--prompt-file", default=None,
                         help="从文件读取 prompt")
     parser.add_argument("--max-tokens", type=int, default=128)
@@ -643,12 +707,10 @@ def main():
     parser.add_argument("--decode-port", type=int, default=DECODE_PORT)
 
     # 自定义场景参数
-    parser.add_argument("--bw-before", type=float, default=0,
-                        help="自定义: 传输前带宽 Mbps")
-    parser.add_argument("--bw-during", type=float, default=0,
+    parser.add_argument("--pre-tc", type=float, default=0,
+                        help="自定义: prefill 启动前带宽 Mbps")
+    parser.add_argument("--transfer-tc", type=float, default=0,
                         help="自定义: 传输中带宽 Mbps")
-    parser.add_argument("--bw-after", type=float, default=0,
-                        help="自定义: 传输后带宽 Mbps")
     parser.add_argument("--delay", type=float, default=0,
                         help="自定义: 延迟 ms")
     parser.add_argument("--loss", type=float, default=0,
@@ -656,7 +718,7 @@ def main():
 
     args = parser.parse_args()
 
-    # 信号处理: 确保清除 tc
+    # 信号处理
     def cleanup(signum=None, frame=None):
         print("\n[CLEANUP] 清除 tc 规则...")
         tc_clear(PREFILL_HOST)
@@ -670,13 +732,8 @@ def main():
     r = ssh_cmd(PREFILL_HOST, "echo ok", timeout=5)
     if r.returncode != 0 or "ok" not in r.stdout:
         print(f"[ERROR] 无法连接到 {PREFILL_USER}@{PREFILL_HOST}")
-        print(f"        请确认 SSH 免密登录已配置")
         sys.exit(1)
     print(f"[OK] {PREFILL_HOST} 可达")
-
-    # 检查 decode 节点
-    print(f"[CHECK] 测试 decode 节点 {args.decode_host}:{args.decode_port}...")
-    # (由 prefill_node.py 内部检查，这里只做提示)
 
     # 处理 prompt
     prompt = args.prompt
@@ -685,7 +742,6 @@ def main():
             prompt = f.read().strip()
         print(f"[INFO] 从文件读取 prompt: {args.prompt_file} ({len(prompt)} chars)")
     elif prompt is None:
-        # 默认: 足够长的 prompt 以产生大的 KV cache (触发 ABKT 压缩)
         prompt = (
             "请详细撰写一篇关于人工智能发展历史的长文，涵盖以下内容："
             "1) 1950年代图灵测试和达特茅斯会议的起源；"
@@ -732,14 +788,13 @@ def main():
     # ── 全场景测试 ──
     if args.all:
         results = {}
-        for name in ["baseline", "mid_drop", "mid_drop_severe",
-                      "constant_low", "gradual", "with_loss"]:
+        for name in ["baseline", "constant_low", "mid_drop",
+                      "gradual", "with_loss", "oscillating"]:
             sc = SCENARIOS[name]
             r = run_single_test(scenario=sc, **test_kwargs)
             results[name] = r
             time.sleep(3)
 
-        # 打印汇总
         print(f"\n{'═' * 70}")
         print(f"  汇总对比")
         print(f"{'═' * 70}")
@@ -765,14 +820,13 @@ def main():
     if args.scenario == "custom":
         scenario = TestScenario(
             name="custom",
-            description=f"自定义: during={args.bw_during}Mbps, "
+            description=f"自定义: pre={args.pre_tc}Mbps, "
+                        f"transfer={args.transfer_tc}Mbps, "
                         f"delay={args.delay}ms, loss={args.loss}%",
-            bw_before_mbps=args.bw_before,
-            bw_during_mbps=args.bw_during,
-            bw_after_mbps=args.bw_after,
+            pre_tc_mbps=args.pre_tc,
+            transfer_tc_mbps=args.transfer_tc,
             delay_ms=args.delay,
             loss_pct=args.loss,
-            wait_for_transfer=(args.bw_during > 0),
         )
 
     run_single_test(scenario=scenario, **test_kwargs)

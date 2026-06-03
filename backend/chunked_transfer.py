@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 MIN_CHUNK_SIZE = 16
 MAX_CHUNK_SIZE = 256
-TIMING_CHECK_INTERVAL = 3   # check throughput every N chunks
+TIMING_CHECK_INTERVAL = 2   # check throughput every N chunks
 SLOW_THRESHOLD = 0.7        # actual_bw < expected * threshold → downgrade
 
 
