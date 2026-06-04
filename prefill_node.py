@@ -158,13 +158,32 @@ def run_prefill_turn(
 
     # Step 3: Get network snapshot and compute dynamic budget
     total_fp16 = PrecisionAllocator._total_bytes(abkt_kv, Precision.FP16)
+    int2_total = PrecisionAllocator._total_bytes(abkt_kv, Precision.INT2)
     snapshot = probe.get_snapshot(total_bytes=total_fp16)
     budget = snapshot.budget_bytes
 
+    # Adaptive budget: ensure budget is enough for INT2 + upgrade headroom.
+    # Fixed TARGET_TRANSFER_TIME (2s) is too aggressive for large KV caches —
+    # at 0.7 MB/s it gives only 1.4 MB budget for 13 MB of INT2 data.
+    MIN_HEADROOM = 1.5  # 50% above INT2 for importance-based upgrades
+    MIN_TARGET_TIME = 2.0
+    MAX_TARGET_TIME = 60.0
+    bw = snapshot.bandwidth_ewma
+    int2_time = int2_total / max(bw, 1.0)
+    adaptive_time = max(MIN_TARGET_TIME,
+                        min(MAX_TARGET_TIME, int2_time * MIN_HEADROOM))
+    adaptive_budget = bw * adaptive_time
+    if adaptive_budget > budget:
+        print(f"[prefill] ABKT: Adaptive budget: {budget/1e6:.1f} MB → "
+              f"{adaptive_budget/1e6:.1f} MB (INT2 needs {int2_time:.1f}s, "
+              f"target={adaptive_time:.1f}s)")
+        budget = adaptive_budget
+
     print(f"[prefill] ABKT: state={snapshot.state.value} "
-          f"bw={snapshot.bandwidth_ewma/1e6:.1f} MB/s "
+          f"bw={bw/1e6:.1f} MB/s "
           f"budget={budget/1e6:.1f} MB "
-          f"fp16_total={total_fp16/1e6:.1f} MB")
+          f"fp16_total={total_fp16/1e6:.1f} MB "
+          f"int2_total={int2_total/1e6:.1f} MB")
 
     # Step 4: Allocate precision under budget
     allocator = PrecisionAllocator()
