@@ -152,12 +152,17 @@ class PrecisionAllocator:
             dropped = []
             freed = 0.0
             deficit = min_floor - budget_bytes
+            prec_names = {16: "FP16", 8: "FP8 ", 4: "INT4", 2: "INT2"}
+            print("[allocator] === Layer Importance Ranking (lowest first) ===")
             for imp, dnode, lidx, elem_cnt in reversed(entries):
-                if freed >= deficit:
-                    break
-                dropped.append(lidx)
                 layer_min = self._min_precision_for_layer(lidx, num_layers_total, 999)
-                freed += elem_cnt * BYTES_PER_ELEMENT[layer_min]
+                layer_bytes = elem_cnt * BYTES_PER_ELEMENT[layer_min]
+                drop_tag = " ← DROP" if freed < deficit else ""
+                print(f"[allocator]   layer {lidx:2d}: imp={imp:.3f}  min={prec_names.get(layer_min.value, '????')}  size={layer_bytes/1024:5.0f} KB{drop_tag}")
+                if freed < deficit:
+                    dropped.append(lidx)
+                    freed += layer_bytes
+            print(f"[allocator] Dropping {len(dropped)} layers frees {freed/1024:.0f} KB, deficit was {deficit/1024:.0f} KB")
             # Return empty map with feasible=False
             return AllocationResult(
                 precision_map={},
@@ -206,6 +211,25 @@ class PrecisionAllocator:
                     cur_prec = target
                 else:
                     break
+
+        # Log per-layer allocation decisions
+        print("[allocator] === Per-Layer Precision Allocation ===")
+        print(f"[allocator] Budget: {budget_bytes/1e6:.2f} MB, FP16 total: {total_fp16/1e6:.2f} MB")
+        prec_names = {16: "FP16", 8: "FP8 ", 4: "INT4", 2: "INT2"}
+        for imp, dnode, lidx, elem_cnt in entries:
+            min_p = entry_min_prec[(dnode, lidx)]
+            final_p = assignments[(dnode, lidx)]
+            min_name = prec_names.get(min_p.value, "????")
+            final_name = prec_names.get(final_p.value, "????")
+            layer_bytes = BYTES_PER_ELEMENT[final_p] * elem_cnt
+            if final_p.value > min_p.value:
+                tag = f"↑ upgraded {min_name}→{final_name}"
+            elif final_p.value < min_p.value:
+                tag = "↓ downgraded"
+            else:
+                tag = "= min"
+            print(f"[allocator]   layer {lidx:2d}: imp={imp:.3f}  min={min_name}  → {final_name}  ({layer_bytes/1024:5.0f} KB)  {tag}")
+        print("[allocator] === End Allocation ===")
 
         # Build output precision_map
         precision_map: Dict[int, Dict[int, torch.Tensor]] = {}
