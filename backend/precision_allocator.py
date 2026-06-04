@@ -58,7 +58,9 @@ class AllocationResult:
         budget_bytes: Budget provided.
         avg_precision_bits: Weighted average bits per element.
         compression_ratio: FP16 size / actual size.
-        feasible: Whether the budget can accommodate minimum (FP8) precision.
+        feasible: Whether the budget can accommodate minimum precision.
+        forced_int2: True when all layers forced to INT2 to fit within
+            extended transfer time (budget was below normal minimum floor).
         dropped_layers: Layers suggested for dropping when infeasible.
     """
     precision_map: Dict[int, Dict[int, torch.Tensor]]
@@ -67,6 +69,7 @@ class AllocationResult:
     avg_precision_bits: float
     compression_ratio: float
     feasible: bool = True
+    forced_int2: bool = False
     dropped_layers: Optional[List[int]] = None
 
 
@@ -142,35 +145,33 @@ class PrecisionAllocator:
                 min_prec = self._min_precision_for_layer(lidx, num_layers_total, 999)
                 min_floor += elem_count * BYTES_PER_ELEMENT[min_prec]
 
-        # Budget below minimum floor — infeasible, suggest layers to drop
+        # Budget below minimum floor — force all layers to INT2
         if budget_bytes < min_floor:
+            int2_total = self._total_bytes(kv_cache, Precision.INT2)
             logger.warning(
-                "Budget %.2f MB below minimum floor %.2f MB — infeasible",
-                budget_bytes / 1e6, min_floor / 1e6,
+                "Budget %.2f MB below minimum floor %.2f MB — "
+                "forcing all layers to INT2 (%.2f MB)",
+                budget_bytes / 1e6, min_floor / 1e6, int2_total / 1e6,
             )
-            # Suggest dropping layers from lowest importance (end of sorted list)
-            dropped = []
-            freed = 0.0
-            deficit = min_floor - budget_bytes
             prec_names = {16: "FP16", 8: "FP8 ", 4: "INT4", 2: "INT2"}
-            print("[allocator] === Layer Importance Ranking (lowest first) ===")
-            for imp, dnode, lidx, elem_cnt in reversed(entries):
-                layer_min = self._min_precision_for_layer(lidx, num_layers_total, 999)
-                layer_bytes = elem_cnt * BYTES_PER_ELEMENT[layer_min]
-                drop_tag = " ← DROP" if freed < deficit else ""
-                print(f"[allocator]   layer {lidx:2d}: imp={imp:.3f}  min={prec_names.get(layer_min.value, '????')}  size={layer_bytes/1024:5.0f} KB{drop_tag}")
-                if freed < deficit:
-                    dropped.append(lidx)
-                    freed += layer_bytes
-            print(f"[allocator] Dropping {len(dropped)} layers frees {freed/1024:.0f} KB, deficit was {deficit/1024:.0f} KB")
-            # Return empty map with feasible=False
+            print("[allocator] Budget infeasible — forcing all layers to INT2")
+            print(f"[allocator]   budget={budget_bytes/1e6:.2f} MB, "
+                  f"min_floor={min_floor/1e6:.2f} MB, "
+                  f"INT2_total={int2_total/1e6:.2f} MB")
+            for imp, dnode, lidx, elem_cnt in entries:
+                print(f"[allocator]   layer {lidx:2d}: imp={imp:.3f} → INT2 "
+                      f"({elem_cnt * BYTES_PER_ELEMENT[Precision.INT2]/1024:.0f} KB)")
+            # Build fallback drop list (lowest importance first) for caller
+            dropped = [lidx for _, _, lidx, _ in reversed(entries)]
+            int2_map = self._uniform_map(kv_cache, Precision.INT2)
             return AllocationResult(
-                precision_map={},
-                total_bytes=min_floor,
+                precision_map=int2_map,
+                total_bytes=int2_total,
                 budget_bytes=budget_bytes,
-                avg_precision_bits=8.0,
-                compression_ratio=total_fp16 / max(min_floor, 1),
+                avg_precision_bits=2.0,
+                compression_ratio=total_fp16 / max(int2_total, 1),
                 feasible=False,
+                forced_int2=True,
                 dropped_layers=dropped,
             )
 
