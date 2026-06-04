@@ -727,6 +727,10 @@ Qwen2.5-3B KV cache (173 tokens): ~6.4 MB
   # 对比:
   python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --compare baseline constant_low
 
+  # 从文件读取 prompt:
+  python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario constant_low \\
+      --txt-prompt /tmp/prompt_2k.txt
+
   # 自定义:
   python3 test_orchestrator.py --model /ssd/models/qwen2.5-3b --scenario custom \\
       --pre-tc 10 --transfer-tc 5
@@ -743,8 +747,8 @@ Qwen2.5-3B KV cache (173 tokens): ~6.4 MB
                         help="运行所有场景并对比")
     parser.add_argument("--prompt", default=None,
                         help="输入 prompt")
-    parser.add_argument("--prompt-file", default=None,
-                        help="从文件读取 prompt")
+    parser.add_argument("--prompt-file", "--txt-prompt", default=None,
+                        help="从 txt 文件读取 prompt")
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=1.0)
