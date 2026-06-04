@@ -145,35 +145,97 @@ class PrecisionAllocator:
                 min_prec = self._min_precision_for_layer(lidx, num_layers_total, 999)
                 min_floor += elem_count * BYTES_PER_ELEMENT[min_prec]
 
-        # Budget below minimum floor — force all layers to INT2
+        # Budget below minimum floor — importance-based allocation
         if budget_bytes < min_floor:
             int2_total = self._total_bytes(kv_cache, Precision.INT2)
             logger.warning(
                 "Budget %.2f MB below minimum floor %.2f MB — "
-                "forcing all layers to INT2 (%.2f MB)",
+                "INT2 total %.2f MB",
                 budget_bytes / 1e6, min_floor / 1e6, int2_total / 1e6,
             )
-            prec_names = {16: "FP16", 8: "FP8 ", 4: "INT4", 2: "INT2"}
-            print("[allocator] Budget infeasible — forcing all layers to INT2")
-            print(f"[allocator]   budget={budget_bytes/1e6:.2f} MB, "
-                  f"min_floor={min_floor/1e6:.2f} MB, "
-                  f"INT2_total={int2_total/1e6:.2f} MB")
-            for imp, dnode, lidx, elem_cnt in entries:
-                print(f"[allocator]   layer {lidx:2d}: imp={imp:.3f} → INT2 "
-                      f"({elem_cnt * BYTES_PER_ELEMENT[Precision.INT2]/1024:.0f} KB)")
-            # Build fallback drop list (lowest importance first) for caller
-            dropped = [lidx for _, _, lidx, _ in reversed(entries)]
-            int2_map = self._uniform_map(kv_cache, Precision.INT2)
-            return AllocationResult(
-                precision_map=int2_map,
-                total_bytes=int2_total,
-                budget_bytes=budget_bytes,
-                avg_precision_bits=2.0,
-                compression_ratio=total_fp16 / max(int2_total, 1),
-                feasible=False,
-                forced_int2=True,
-                dropped_layers=dropped,
-            )
+
+            if int2_total <= budget_bytes:
+                # INT2 fits within budget — upgrade important layers
+                assignments: Dict[Tuple[int, int], Precision] = {}
+                current_bytes = 0.0
+                for _, dnode, lidx, elem_cnt in entries:
+                    assignments[(dnode, lidx)] = Precision.INT2
+                    current_bytes += BYTES_PER_ELEMENT[Precision.INT2] * elem_cnt
+
+                prec_order = self._sorted_precisions
+                for imp, dnode, lidx, elem_cnt in entries:
+                    cur_prec = assignments[(dnode, lidx)]
+                    cur_idx = prec_order.index(cur_prec)
+                    for upgrade_idx in range(cur_idx - 1, -1, -1):
+                        target = prec_order[upgrade_idx]
+                        cost = (BYTES_PER_ELEMENT[target] - BYTES_PER_ELEMENT[cur_prec]) * elem_cnt
+                        if current_bytes + cost <= budget_bytes + 1e-6:
+                            assignments[(dnode, lidx)] = target
+                            current_bytes += cost
+                            cur_prec = target
+                        else:
+                            break
+
+                precision_map: Dict[int, Dict[int, torch.Tensor]] = {}
+                for dnode, layer_cache in kv_cache.items():
+                    precision_map[dnode] = {}
+                    for lidx, kv in layer_cache.items():
+                        if kv is None:
+                            continue
+                        prec = assignments.get((dnode, lidx), Precision.INT2)
+                        seq_len = kv[0].shape[2]
+                        precision_map[dnode][lidx] = torch.full(
+                            (seq_len,), prec.value, dtype=torch.int8
+                        )
+
+                avg_bits = self._avg_precision(precision_map)
+                cr = total_fp16 / max(current_bytes, 1)
+                dropped = [lidx for _, _, lidx, _ in reversed(entries)]
+
+                prec_names = {16: "FP16", 8: "FP8 ", 4: "INT4", 2: "INT2"}
+                print("[allocator] Budget infeasible — importance-based upgrade from INT2")
+                print(f"[allocator]   budget={budget_bytes/1e6:.2f} MB, "
+                      f"INT2_total={int2_total/1e6:.2f} MB")
+                for imp, dnode, lidx, elem_cnt in entries:
+                    final_p = assignments[(dnode, lidx)]
+                    final_name = prec_names.get(final_p.value, "????")
+                    layer_bytes = BYTES_PER_ELEMENT[final_p] * elem_cnt
+                    tag = "↑ upgraded" if final_p.value > 2 else "= INT2"
+                    print(f"[allocator]   layer {lidx:2d}: imp={imp:.3f} → {final_name}  "
+                          f"({layer_bytes/1024:.0f} KB)  {tag}")
+
+                return AllocationResult(
+                    precision_map=precision_map,
+                    total_bytes=current_bytes,
+                    budget_bytes=budget_bytes,
+                    avg_precision_bits=avg_bits,
+                    compression_ratio=cr,
+                    feasible=False,
+                    forced_int2=True,
+                    dropped_layers=dropped,
+                )
+            else:
+                # INT2 total exceeds budget — return all layers at INT2.
+                # Caller will check transfer time and decide whether to proceed.
+                prec_names = {16: "FP16", 8: "FP8 ", 4: "INT4", 2: "INT2"}
+                print("[allocator] Budget infeasible — all layers at INT2")
+                print(f"[allocator]   budget={budget_bytes/1e6:.2f} MB, "
+                      f"INT2_total={int2_total/1e6:.2f} MB")
+                for imp, dnode, lidx, elem_cnt in entries:
+                    print(f"[allocator]   layer {lidx:2d}: imp={imp:.3f} → INT2 "
+                          f"({elem_cnt * BYTES_PER_ELEMENT[Precision.INT2]/1024:.0f} KB)")
+                dropped = [lidx for _, _, lidx, _ in reversed(entries)]
+                int2_map = self._uniform_map(kv_cache, Precision.INT2)
+                return AllocationResult(
+                    precision_map=int2_map,
+                    total_bytes=int2_total,
+                    budget_bytes=budget_bytes,
+                    avg_precision_bits=2.0,
+                    compression_ratio=total_fp16 / max(int2_total, 1),
+                    feasible=False,
+                    forced_int2=True,
+                    dropped_layers=dropped,
+                )
 
         compression_needed = total_fp16 / max(budget_bytes, 1)
 
