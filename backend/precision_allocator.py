@@ -204,6 +204,16 @@ class PrecisionAllocator:
                     print(f"[allocator]   layer {lidx:2d}: imp={imp:.3f} → {final_name}  "
                           f"({layer_bytes/1024:.0f} KB)  {tag}")
 
+                # Add metadata overhead
+                meta_overhead = 0.0
+                for (dn, li), p in assignments.items():
+                    if p in (Precision.INT4, Precision.INT2):
+                        kv = kv_cache.get(dn, {}).get(li)
+                        if kv is not None:
+                            k, _ = kv
+                            meta_overhead += (k.shape[3] + k.shape[2]) * 4.0
+                current_bytes += meta_overhead
+
                 return AllocationResult(
                     precision_map=precision_map,
                     total_bytes=current_bytes,
@@ -226,12 +236,13 @@ class PrecisionAllocator:
                           f"({elem_cnt * BYTES_PER_ELEMENT[Precision.INT2]/1024:.0f} KB)")
                 dropped = [lidx for _, _, lidx, _ in reversed(entries)]
                 int2_map = self._uniform_map(kv_cache, Precision.INT2)
+                int2_meta = self.metadata_bytes(kv_cache, Precision.INT2)
                 return AllocationResult(
                     precision_map=int2_map,
-                    total_bytes=int2_total,
+                    total_bytes=int2_total + int2_meta,
                     budget_bytes=budget_bytes,
                     avg_precision_bits=2.0,
-                    compression_ratio=total_fp16 / max(int2_total, 1),
+                    compression_ratio=total_fp16 / max(int2_total + int2_meta, 1),
                     feasible=False,
                     forced_int2=True,
                     dropped_layers=dropped,
@@ -307,6 +318,18 @@ class PrecisionAllocator:
                     (seq_len,), prec.value, dtype=torch.int8
                 )
 
+        # Add metadata overhead (KIVI scale/zero tensors) to total_bytes
+        meta_overhead = 0.0
+        for (dnode, lidx), prec in assignments.items():
+            if prec in (Precision.INT4, Precision.INT2):
+                kv = kv_cache.get(dnode, {}).get(lidx)
+                if kv is not None:
+                    k, _ = kv
+                    head_dim = k.shape[3]
+                    seq_len = k.shape[2]
+                    meta_overhead += (head_dim + seq_len) * 4.0
+        current_bytes += meta_overhead
+
         avg_bits = self._avg_precision(precision_map)
         cr = total_fp16 / max(current_bytes, 1)
 
@@ -325,6 +348,41 @@ class PrecisionAllocator:
                     continue
                 k, v = kv
                 total += (k.numel() + v.numel()) * bpe
+        return total
+
+    @staticmethod
+    def metadata_bytes(
+        kv_cache: Dict[int, Dict[int, Tuple[torch.Tensor, torch.Tensor]]],
+        precision: Precision,
+    ) -> float:
+        """Estimate serialization metadata size for KIVI quantization.
+
+        For INT4/INT2: per-channel scale/zero for K, per-token scale/zero for V.
+        Each scale/zero is a float16 tensor → 2 bytes per element.
+        Total per layer: (head_dim + seq_len) × 4 bytes.
+
+        For FP8: scalar scale/zero → ~8 bytes per layer (negligible).
+        For FP16: 0 bytes.
+        """
+        if precision in (Precision.FP16,):
+            return 0.0
+        if precision == Precision.FP8:
+            # Scalar scale + zero_point for K and V → 4 scalars × 2 bytes
+            count = sum(1 for lc in kv_cache.values()
+                        for kv in lc.values() if kv is not None)
+            return count * 8.0
+        # INT4 / INT2: per-channel K scales + per-token V scales
+        total = 0.0
+        for layer_cache in kv_cache.values():
+            for kv in layer_cache.values():
+                if kv is None:
+                    continue
+                k, v = kv
+                head_dim = k.shape[3]
+                seq_len = k.shape[2]
+                # scale_k + zero_k: [1,1,1,head_dim] × 2 tensors × 2 bytes
+                # scale_v + zero_v: [1,1,seq_len,1] × 2 tensors × 2 bytes
+                total += (head_dim + seq_len) * 4.0
         return total
 
     @staticmethod

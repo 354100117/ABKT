@@ -85,6 +85,7 @@ class ChunkedSender:
 
         # Track which layers have been sent vs are still pending
         sent_layers = set()
+        meta_sent = set()   # layers whose metadata has been sent
         active_quantized = quantized_kv
         active_metadata = metadata
 
@@ -111,7 +112,10 @@ class ChunkedSender:
                         print(f"[sender] chunk #{total_chunks} layer={lidx} "
                               f"[{start}:{end}] {chunk_bytes/1024:.1f}KB "
                               f"last={end >= seq_len}")
-                    self.send_fn({
+                    # Send metadata only with the first chunk of each layer
+                    # to avoid redundant serialization (~6 KB × 84 chunks/layer)
+                    include_meta = lidx not in meta_sent
+                    msg = {
                         "request_id": request_id,
                         "layer_idx": lidx,
                         "chunk_start": start,
@@ -119,9 +123,12 @@ class ChunkedSender:
                         "total_seq_len": seq_len,
                         "k": k_chunk,
                         "v": v_chunk,
-                        "meta": meta,
+                        "meta": meta if include_meta else {},
                         "is_last_chunk": (end >= seq_len),
-                    })
+                    }
+                    self.send_fn(msg)
+                    if include_meta:
+                        meta_sent.add(lidx)
                     if on_progress is not None:
                         on_progress(total_bytes, total_expected)
 

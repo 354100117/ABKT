@@ -160,6 +160,8 @@ def run_prefill_turn(
     total_fp16 = PrecisionAllocator._total_bytes(abkt_kv, Precision.FP16)
     int4_total = PrecisionAllocator._total_bytes(abkt_kv, Precision.INT4)
     int2_total = PrecisionAllocator._total_bytes(abkt_kv, Precision.INT2)
+    # Metadata overhead: KIVI per-channel/per-token scales (INT4/INT2 layers)
+    int4_meta = PrecisionAllocator.metadata_bytes(abkt_kv, Precision.INT4)
     snapshot = probe.get_snapshot(total_bytes=total_fp16)
     budget = snapshot.budget_bytes
     bw = snapshot.bandwidth_ewma
@@ -167,13 +169,14 @@ def run_prefill_turn(
     # Quality-driven budget: INT4 is the quality floor.
     # "质量大于时效" — quality over speed. Every layer must get at least INT4
     # precision to ensure acceptable output quality. INT2 produces gibberish.
-    # Budget = max(probe_budget, int4_total) so the allocator can assign INT4
-    # to all layers, with headroom for important layers to upgrade to FP8/FP16.
+    # Budget = max(probe_budget, int4_total + metadata) so the allocator can
+    # assign INT4 to all layers, with headroom for upgrades.
     INT4_HEADROOM = 1.3  # 30% above INT4 for importance-based upgrades
-    int4_floor = int4_total * INT4_HEADROOM
+    int4_floor = (int4_total + int4_meta) * INT4_HEADROOM
     if int4_floor > budget:
         print(f"[prefill] ABKT: Quality floor: {budget/1e6:.1f} MB → "
-              f"{int4_floor/1e6:.1f} MB (INT4={int4_total/1e6:.1f} MB × {INT4_HEADROOM})")
+              f"{int4_floor/1e6:.1f} MB "
+              f"(INT4 data={int4_total/1e6:.1f} MB + meta={int4_meta/1e6:.2f} MB) × {INT4_HEADROOM})")
         budget = int4_floor
 
     # Safety cap: don't let transfer time exceed practical limits
@@ -189,7 +192,7 @@ def run_prefill_turn(
           f"bw={bw/1e6:.1f} MB/s "
           f"budget={budget/1e6:.1f} MB "
           f"fp16={total_fp16/1e6:.1f} MB "
-          f"int4={int4_total/1e6:.1f} MB "
+          f"int4={int4_total/1e6:.1f}+{int4_meta/1e6:.2f} MB "
           f"int2={int2_total/1e6:.1f} MB "
           f"est_time={est_time:.1f}s")
 
