@@ -158,91 +158,82 @@ def run_prefill_turn(
 
     # Step 3: Get network snapshot and compute dynamic budget
     total_fp16 = PrecisionAllocator._total_bytes(abkt_kv, Precision.FP16)
+    int4_total = PrecisionAllocator._total_bytes(abkt_kv, Precision.INT4)
     int2_total = PrecisionAllocator._total_bytes(abkt_kv, Precision.INT2)
     snapshot = probe.get_snapshot(total_bytes=total_fp16)
     budget = snapshot.budget_bytes
-
-    # Adaptive budget: ensure budget is enough for INT2 + upgrade headroom.
-    # Fixed TARGET_TRANSFER_TIME (2s) is too aggressive for large KV caches —
-    # at 0.7 MB/s it gives only 1.4 MB budget for 13 MB of INT2 data.
-    MIN_HEADROOM = 1.5  # 50% above INT2 for importance-based upgrades
-    MIN_TARGET_TIME = 2.0
-    MAX_TARGET_TIME = 60.0
     bw = snapshot.bandwidth_ewma
-    int2_time = int2_total / max(bw, 1.0)
-    adaptive_time = max(MIN_TARGET_TIME,
-                        min(MAX_TARGET_TIME, int2_time * MIN_HEADROOM))
-    adaptive_budget = bw * adaptive_time
-    if adaptive_budget > budget:
-        print(f"[prefill] ABKT: Adaptive budget: {budget/1e6:.1f} MB → "
-              f"{adaptive_budget/1e6:.1f} MB (INT2 needs {int2_time:.1f}s, "
-              f"target={adaptive_time:.1f}s)")
-        budget = adaptive_budget
 
+    # Quality-driven budget: INT4 is the quality floor.
+    # "质量大于时效" — quality over speed. Every layer must get at least INT4
+    # precision to ensure acceptable output quality. INT2 produces gibberish.
+    # Budget = max(probe_budget, int4_total) so the allocator can assign INT4
+    # to all layers, with headroom for important layers to upgrade to FP8/FP16.
+    INT4_HEADROOM = 1.3  # 30% above INT4 for importance-based upgrades
+    int4_floor = int4_total * INT4_HEADROOM
+    if int4_floor > budget:
+        print(f"[prefill] ABKT: Quality floor: {budget/1e6:.1f} MB → "
+              f"{int4_floor/1e6:.1f} MB (INT4={int4_total/1e6:.1f} MB × {INT4_HEADROOM})")
+        budget = int4_floor
+
+    # Safety cap: don't let transfer time exceed practical limits
+    MAX_TRANSFER_TIME = 60.0
+    max_budget = bw * MAX_TRANSFER_TIME
+    if budget > max_budget:
+        print(f"[prefill] ABKT: Budget capped: {budget/1e6:.1f} MB → "
+              f"{max_budget/1e6:.1f} MB ({MAX_TRANSFER_TIME:.0f}s × {bw/1e6:.1f} MB/s)")
+        budget = max_budget
+
+    est_time = budget / max(bw, 1.0)
     print(f"[prefill] ABKT: state={snapshot.state.value} "
           f"bw={bw/1e6:.1f} MB/s "
           f"budget={budget/1e6:.1f} MB "
-          f"fp16_total={total_fp16/1e6:.1f} MB "
-          f"int2_total={int2_total/1e6:.1f} MB")
+          f"fp16={total_fp16/1e6:.1f} MB "
+          f"int4={int4_total/1e6:.1f} MB "
+          f"int2={int2_total/1e6:.1f} MB "
+          f"est_time={est_time:.1f}s")
 
     # Step 4: Allocate precision under budget
     allocator = PrecisionAllocator()
     allocation = allocator.allocate(importance_map, abkt_kv, budget,
                                     num_layers_total=num_layers)
 
-    # Handle infeasible budget — allocator uses importance-based allocation
-    # When INT2 total > budget, all layers are at INT2; check transfer time
+    # Handle infeasible budget — quality-driven: drop layers rather than
+    # degrade to INT2. "30 layers at INT4 > 36 layers at INT2 gibberish."
     if not allocation.feasible:
-        n_kept = len(allocation.precision_map.get(0, {}))
-        n_dropped = num_layers - n_kept
         bw = snapshot.bandwidth_ewma
         transfer_time = allocation.total_bytes / max(bw, 1.0)
-        MAX_TRANSFER_TIME = 60.0
+        print(f"[prefill] ABKT: Budget infeasible ({budget/1e6:.1f} MB), "
+              f"dropping least important layers to maintain INT4 quality...")
 
-        if n_dropped > 0:
-            # Allocator dropped layers to fit budget — use its result
-            print(f"[prefill] ABKT: Budget infeasible — kept {n_kept}/{num_layers} layers, "
-                  f"est_transfer={transfer_time:.1f}s")
-            kept_layers = set(allocation.precision_map.get(0, {}).keys())
-            for dnode in list(abkt_kv.keys()):
-                for lidx in list(abkt_kv[dnode].keys()):
-                    if lidx not in kept_layers:
+        dropped = allocation.dropped_layers or []
+        # Drop layers one at a time until remaining fit at INT4
+        for num_drop in range(1, len(dropped) + 1):
+            trial_dropped = dropped[:num_drop]
+            trial_kv = {}
+            for dnode in abkt_kv:
+                trial_kv[dnode] = {l: v for l, v in abkt_kv[dnode].items()
+                                    if l not in trial_dropped}
+            trial_int4 = PrecisionAllocator._total_bytes(trial_kv, Precision.INT4)
+            if trial_int4 <= budget:
+                print(f"[prefill] ABKT: Dropping {num_drop} layers "
+                      f"→ INT4={trial_int4/1e6:.1f} MB fits in {budget/1e6:.1f} MB budget")
+                for dnode in list(abkt_kv.keys()):
+                    for lidx in trial_dropped:
                         abkt_kv[dnode].pop(lidx, None)
                         importance_map.get(dnode, {}).pop(lidx, None)
-            num_layers = n_kept
-            total_fp16 = PrecisionAllocator._total_bytes(abkt_kv, Precision.FP16)
-        elif transfer_time <= MAX_TRANSFER_TIME:
-            # All layers at INT2, transfer time acceptable
-            print(f"[prefill] ABKT: All {num_layers} layers at INT2, "
-                  f"est_transfer={transfer_time:.1f}s (max={MAX_TRANSFER_TIME:.0f}s) — proceeding")
-            total_fp16 = PrecisionAllocator._total_bytes(abkt_kv, Precision.FP16)
+                num_layers -= num_drop
+                total_fp16 = PrecisionAllocator._total_bytes(abkt_kv, Precision.FP16)
+                allocation = allocator.allocate(importance_map, abkt_kv, budget,
+                                                num_layers_total=num_layers)
+                break
         else:
-            # Transfer time too long — drop least important layers
-            print(f"[prefill] ABKT: Transfer time {transfer_time:.1f}s > {MAX_TRANSFER_TIME:.0f}s, "
-                  f"dropping layers...")
-            dropped = allocation.dropped_layers or []
-            for num_drop in range(1, len(dropped) + 1):
-                trial_dropped = dropped[:num_drop]
-                trial_kv = {}
-                for dnode in abkt_kv:
-                    trial_kv[dnode] = {l: v for l, v in abkt_kv[dnode].items()
-                                        if l not in trial_dropped}
-                trial_int2 = PrecisionAllocator._total_bytes(trial_kv, Precision.INT2)
-                trial_time = trial_int2 / max(bw, 1.0)
-                if trial_time <= MAX_TRANSFER_TIME:
-                    print(f"[prefill] ABKT: Dropping {num_drop} layers "
-                          f"→ {trial_int2/1e6:.1f} MB, est={trial_time:.1f}s")
-                    for dnode in list(abkt_kv.keys()):
-                        for lidx in trial_dropped:
-                            abkt_kv[dnode].pop(lidx, None)
-                            importance_map.get(dnode, {}).pop(lidx, None)
-                    num_layers -= num_drop
-                    total_fp16 = PrecisionAllocator._total_bytes(abkt_kv, Precision.FP16)
-                    allocation = allocator.allocate(importance_map, abkt_kv, budget,
-                                                    num_layers_total=num_layers)
-                    break
-            else:
-                print(f"[prefill] ABKT: Warning — cannot meet transfer time constraint")
+            # Even dropping all but most important layers doesn't fit INT4
+            # Last resort: use the allocator's importance-based result
+            transfer_time = allocation.total_bytes / max(bw, 1.0)
+            print(f"[prefill] ABKT: Cannot fit INT4 even with layer drops, "
+                  f"using allocator result ({allocation.avg_precision_bits:.1f} bits, "
+                  f"est_transfer={transfer_time:.1f}s)")
 
     print(f"[prefill] ABKT: avg_bits={allocation.avg_precision_bits:.1f} "
           f"compression={allocation.compression_ratio:.1f}x "
