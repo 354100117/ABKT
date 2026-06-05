@@ -57,9 +57,22 @@ class AdaptiveQuantizer:
                 if prec == Precision.FP16:
                     quantized[dnode][lidx] = (k, v)
                     metadata[dnode][lidx] = {"precision": 16}
-                else:
+                elif prec == Precision.FP8:
+                    # FP8: per-layer (symmetric, already good quality)
                     qk, mk = self._quantize(k, prec)
                     qv, mv = self._quantize(v, prec)
+                    quantized[dnode][lidx] = (qk, qv)
+                    metadata[dnode][lidx] = {
+                        "precision": prec.value,
+                        "scale_k": mk["scale"],
+                        "zero_k": mk["zero_point"],
+                        "scale_v": mv["scale"],
+                        "zero_v": mv["zero_point"],
+                    }
+                else:
+                    # INT4/INT2: KIVI-style — per-channel for K, per-token for V
+                    qk, mk = self._quantize_per_channel(k, prec)
+                    qv, mv = self._quantize_per_token(v, prec)
                     quantized[dnode][lidx] = (qk, qv)
                     metadata[dnode][lidx] = {
                         "precision": prec.value,
@@ -103,6 +116,7 @@ class AdaptiveQuantizer:
 
     @staticmethod
     def _quantize(tensor: torch.Tensor, precision: Precision) -> Tuple[torch.Tensor, dict]:
+        """Per-layer quantization (one scale/zero per tensor). Used for FP8."""
         f = tensor.float()
         if precision == Precision.FP8:
             scale = f.abs().max() / 127.0
@@ -132,9 +146,51 @@ class AdaptiveQuantizer:
         return tensor, {"scale": None, "zero_point": None}
 
     @staticmethod
+    def _quantize_per_channel(tensor: torch.Tensor, precision: Precision) -> Tuple[torch.Tensor, dict]:
+        """Per-channel quantization for Keys (dim=3: head_dim).
+
+        K tensors have per-channel outliers — each channel gets its own
+        scale/zero_point. This is the KIVI approach for Key quantization.
+        """
+        f = tensor.float()
+        n_levels = {Precision.INT4: 15, Precision.INT2: 3}[precision]
+        max_val = {Precision.INT4: 15, Precision.INT2: 3}[precision]
+
+        # min/max per channel: reduce over dims 0,1,2 → shape [1,1,1,head_dim]
+        mn = f.amin(dim=(0, 1, 2), keepdim=True)
+        mx = f.amax(dim=(0, 1, 2), keepdim=True)
+        scale = (mx - mn) / n_levels
+        scale = scale.clamp(min=1e-10)
+        zp = torch.round(-mn / scale).clamp(0, max_val)
+        q = torch.clamp(torch.round(f / scale + zp), 0, max_val).to(torch.uint8)
+        return q, {"scale": scale, "zero_point": zp}
+
+    @staticmethod
+    def _quantize_per_token(tensor: torch.Tensor, precision: Precision) -> Tuple[torch.Tensor, dict]:
+        """Per-token quantization for Values (dim=2: seq_len).
+
+        V tensors have per-token outliers — each token position gets its own
+        scale/zero_point. This is the KIVI approach for Value quantization.
+        """
+        f = tensor.float()
+        n_levels = {Precision.INT4: 15, Precision.INT2: 3}[precision]
+        max_val = {Precision.INT4: 15, Precision.INT2: 3}[precision]
+
+        # min/max per token: reduce over dims 0,1,3 → shape [1,1,seq_len,1]
+        mn = f.amin(dim=(0, 1, 3), keepdim=True)
+        mx = f.amax(dim=(0, 1, 3), keepdim=True)
+        scale = (mx - mn) / n_levels
+        scale = scale.clamp(min=1e-10)
+        zp = torch.round(-mn / scale).clamp(0, max_val)
+        q = torch.clamp(torch.round(f / scale + zp), 0, max_val).to(torch.uint8)
+        return q, {"scale": scale, "zero_point": zp}
+
+    @staticmethod
     def _dequantize(qt: torch.Tensor, scale, zero_point, precision: Precision) -> torch.Tensor:
         if scale is None:
             return qt
         if precision in (Precision.INT4, Precision.INT2):
+            # Works for both scalar (per-layer) and tensor (per-channel/per-token)
+            # due to broadcasting: scale [1,1,1,hd] or [1,1,seq,1]
             return ((qt.float() - zero_point) * scale).half()
         return (qt.float() * scale).half()
