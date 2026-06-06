@@ -26,8 +26,13 @@ import time
 from collections import deque
 from typing import Optional
 
-import torch
-
+from backend.config import (
+    DEFAULT_PROBE_PORT, RTT_INTERVAL_SEC, BW_ALPHA, RTT_ALPHA,
+    EWMA_MAX_CHANGE, WARMUP_BYTES, MIN_CALIB_BYTES, MIN_CALIB_ELAPSED,
+    COLD_BW, BW_WINDOW_SIZE, TRANSFER_BW_ALPHA, DIVERGENCE_THRESHOLD,
+    COLD_START_MARGIN, MIN_SAFETY_MARGIN, CONFIDENCE_TRANSFERS,
+    TARGET_TRANSFER_TIME, PROBE_CONNECT_TIMEOUT, PROBE_RTT_TIMEOUT,
+)
 from backend.ewma import EWMA
 from backend.state_machine import NetworkState, NetworkStateMachine
 
@@ -36,27 +41,6 @@ logger = logging.getLogger(__name__)
 # ── Probe protocol constants ──
 PROBE_RTT = 0x01
 PROBE_BW = 0x02
-
-# ── Defaults (tuned for 1 GbE x86↔Jetson) ──
-DEFAULT_PROBE_PORT = 9877
-RTT_INTERVAL_SEC = 1.0
-BW_ALPHA = 0.3            # bandwidth EWMA — calibration data is ground truth
-RTT_ALPHA = 0.5           # RTT EWMA — faster response to congestion
-CALIBRATION_ALPHA = 0.5   # calibration sample weight (higher = trust calibration more)
-EWMA_MAX_CHANGE = 0.20    # ±20% cap per update
-WARMUP_BYTES = 100 * 1024  # 100 KB TCP warmup payload
-MIN_CALIB_BYTES = 1 * 1024 * 1024  # 1 MB — skip calibration for smaller transfers
-MIN_CALIB_ELAPSED = 0.100  # 100ms — skip calibration if too fast
-COLD_BW = 15e6            # conservative cold-start default: 15 MB/s (120 Mbps)
-
-# ── Bandwidth estimation: sliding window + transfer EWMA ──
-BW_WINDOW_SIZE = 10           # sliding window: last 10 probe/transfer samples
-TRANSFER_BW_ALPHA = 0.5       # transfer EWMA — trust actual transfers more
-DIVERGENCE_THRESHOLD = 2.5    # probe/transfer ratio to flag mismatch
-COLD_START_MARGIN = 0.7       # use 70% of estimate when uncalibrated (was 50%)
-MIN_SAFETY_MARGIN = 0.8       # floor: never use more than 80% of estimated bw (was 60%)
-CONFIDENCE_TRANSFERS = 5      # full confidence after this many transfers
-TARGET_TRANSFER_TIME = 2.0    # target transfer time in seconds
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -73,7 +57,7 @@ class ProbeServer:
     def __init__(self, host: str = "0.0.0.0", port: int = DEFAULT_PROBE_PORT):
         self.host = host
         self.port = port
-        self._sock: Optional[torch.socket.socket] = None  # noqa
+        self._sock: Optional[object] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -110,7 +94,7 @@ class ProbeServer:
 
     def _handle(self, conn) -> None:
         import socket as _socket
-        conn.settimeout(10.0)
+        conn.settimeout(PROBE_RTT_TIMEOUT)
         try:
             while self._running:
                 header = conn.recv(1)
@@ -309,7 +293,7 @@ class NetworkProbeClient:
         import socket as _socket
         try:
             sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-            sock.settimeout(5.0)
+            sock.settimeout(PROBE_CONNECT_TIMEOUT)
             sock.connect((self.target_host, self.target_port))
             data = b'\x00' * WARMUP_BYTES
             sock.sendall(bytes([PROBE_BW]) + struct.pack("!I", WARMUP_BYTES) + data)
@@ -384,7 +368,7 @@ class NetworkProbeClient:
         import socket as _socket
         try:
             sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-            sock.settimeout(5.0)
+            sock.settimeout(PROBE_CONNECT_TIMEOUT)
             sock.connect((self.target_host, self.target_port))
 
             data = b'\x00' * data_size
@@ -412,7 +396,7 @@ class NetworkProbeClient:
         import socket as _socket
         try:
             sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-            sock.settimeout(5.0)
+            sock.settimeout(PROBE_CONNECT_TIMEOUT)
             sock.connect((self.target_host, self.target_port))
             self._rtt_conn = sock
             return sock

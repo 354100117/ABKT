@@ -39,6 +39,7 @@ from pd_inference.utils import (
     load_tokenizer,
     pad_batch,
 )
+from backend.config import INT4_HEADROOM, MAX_TRANSFER_TIME, DEFAULT_PROBE_PORT
 from backend.network_probe import NetworkProbeClient
 from backend.token_importance import TokenImportanceEvaluator
 from backend.precision_allocator import PrecisionAllocator, Precision
@@ -179,7 +180,6 @@ def run_prefill_turn(
     # precision to ensure acceptable output quality. INT2 produces gibberish.
     # Budget = max(probe_budget, int4_total + metadata) so the allocator can
     # assign INT4 to all layers, with headroom for upgrades.
-    INT4_HEADROOM = 1.3  # 30% above INT4 for importance-based upgrades
     int4_floor = (int4_total + int4_meta) * INT4_HEADROOM
     if int4_floor > budget:
         print(f"[prefill] ABKT: Quality floor: {budget/1e6:.1f} MB → "
@@ -188,7 +188,6 @@ def run_prefill_turn(
         budget = int4_floor
 
     # Safety cap: don't let transfer time exceed practical limits
-    MAX_TRANSFER_TIME = 60.0
     max_budget = bw * MAX_TRANSFER_TIME
     if budget > max_budget:
         print(f"[prefill] ABKT: Budget capped: {budget/1e6:.1f} MB → "
@@ -644,10 +643,10 @@ def main():
 
     # ── Start network probe ──
     probe = NetworkProbeClient(
-        target_host=config.master_addr, target_port=9877,
+        target_host=config.master_addr, target_port=DEFAULT_PROBE_PORT,
     )
     probe.start()
-    print(f"[prefill] Network probe started (host={config.master_addr}:9877)")
+    print(f"[prefill] Network probe started (host={config.master_addr}:{DEFAULT_PROBE_PORT})")
 
     # ── Load model ──
     num_layers = _get_num_layers(config.model_name)

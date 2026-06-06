@@ -17,6 +17,10 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from backend.config import (
+    IMPORTANCE_ALPHA, IMPORTANCE_BETA, IMPORTANCE_GAMMA, POSITION_DECAY_RATE,
+)
+
 
 class TokenImportanceEvaluator:
     """Evaluates token importance using three-dimensional scoring.
@@ -29,10 +33,20 @@ class TokenImportanceEvaluator:
                                        attention_weights=attn_weights)
     """
 
-    def __init__(self, alpha: float = 0.6, beta: float = 0.25, gamma: float = 0.15):
+    def __init__(self, alpha: float = IMPORTANCE_ALPHA,
+                 beta: float = IMPORTANCE_BETA,
+                 gamma: float = IMPORTANCE_GAMMA):
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
+
+    @staticmethod
+    def _minmax_normalize(t: torch.Tensor) -> torch.Tensor:
+        """Normalize tensor to [0, 1]. Returns ones if range is zero."""
+        tmin, tmax = t.min(), t.max()
+        if tmax > tmin:
+            return (t - tmin) / (tmax - tmin)
+        return torch.ones_like(t)
 
     def compute(
         self,
@@ -80,13 +94,7 @@ class TokenImportanceEvaluator:
                 fused = (self.alpha * attn_score
                          + self.beta * lscore
                          + self.gamma * pos_decay)
-                # Normalize to [0, 1]
-                fmin, fmax = fused.min(), fused.max()
-                if fmax > fmin:
-                    fused = (fused - fmin) / (fmax - fmin)
-                else:
-                    fused = torch.ones_like(fused)
-                result[dnode][lidx] = fused
+                result[dnode][lidx] = self._minmax_normalize(fused)
         return result
 
     def _compute_attention_importance(
@@ -106,11 +114,7 @@ class TokenImportanceEvaluator:
             # (how much total attention each token receives)
             attn = attention_weights.float().mean(dim=(0, 1))  # [seq, seq]
             score = attn.sum(dim=0)  # [seq]
-            if score.max() > score.min():
-                score = (score - score.min()) / (score.max() - score.min())
-            else:
-                score = torch.ones(seq_len, device=score.device)
-            return {"_default": score}
+            return {"_default": self._minmax_normalize(score)}
 
         # Fallback: Key L2-norm proxy (backward-compatible)
         proxy = {}
@@ -161,7 +165,7 @@ class TokenImportanceEvaluator:
         return cvs
 
     @staticmethod
-    def _compute_position_decay(seq_len: int, rate: float = 0.01) -> torch.Tensor:
+    def _compute_position_decay(seq_len: int, rate: float = POSITION_DECAY_RATE) -> torch.Tensor:
         """Dimension 3: exponential position decay.
 
         Recent tokens (higher indices) get higher scores.
@@ -177,8 +181,4 @@ class TokenImportanceEvaluator:
         """Compute normalized token importance from Key tensor (L2-norm proxy)."""
         # k shape: [batch, heads, seq, head_dim]
         norm = torch.linalg.vector_norm(k.float(), dim=(0, 1, 3))  # [seq]
-        if norm.max() > norm.min():
-            scores = (norm - norm.min()) / (norm.max() - norm.min())
-        else:
-            scores = torch.ones_like(norm)
-        return scores  # [seq]
+        return TokenImportanceEvaluator._minmax_normalize(norm)

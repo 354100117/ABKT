@@ -16,7 +16,13 @@ from __future__ import annotations
 
 import enum
 from collections import deque
-from typing import List, Optional, Tuple
+from typing import List
+
+from backend.config import (
+    BW_GOOD_THRESHOLD, BW_POOR_THRESHOLD, RTT_GOOD_THRESHOLD,
+    RTT_DEGRADED_THRESHOLD, DOWNGRADE_VOTES, DOWNGRADE_WINDOW,
+    UPGRADE_VOTES, UPGRADE_WINDOW, TARGET_TRANSFER_TIME,
+)
 
 
 class NetworkState(enum.Enum):
@@ -24,25 +30,6 @@ class NetworkState(enum.Enum):
     DEGRADED = "degraded"
     POOR = "poor"
     UNKNOWN = "unknown"  # before any probe data
-
-
-# ── Thresholds (tunable after experimental measurement) ──
-# Expected practical range on 1 GbE: 40-100 MB/s, RTT 1-10ms
-
-BW_GOOD_THRESHOLD: float = 40e6       # 40 MB/s → above this = GOOD
-BW_POOR_THRESHOLD: float = 15e6       # 15 MB/s → below this = POOR (bandwidth-alone)
-RTT_GOOD_THRESHOLD: float = 10.0      # 10 ms → below this = GOOD
-RTT_DEGRADED_THRESHOLD: float = 20.0  # 20 ms → above this = DEGRADED (RTT-only trigger)
-
-# Hysteresis dead-bands (as fractions of thresholds)
-HYST_GOOD: float = 0.10   # 10% band at GOOD boundary
-HYST_POOR: float = 0.20   # 20% band at POOR boundary (noisier regime)
-
-# Voting windows
-DOWNGRADE_VOTES: int = 2   # 2 of last 3 to downgrade
-DOWNGRADE_WINDOW: int = 3
-UPGRADE_VOTES: int = 4     # 4 of last 5 to upgrade
-UPGRADE_WINDOW: int = 5
 
 
 class NetworkStateMachine:
@@ -125,18 +112,6 @@ class NetworkStateMachine:
         return samples.count(state)
 
     @property
-    def max_delay_sec(self) -> float:
-        """Budget delay multiplier based on current state (feeds precision allocator)."""
-        return {NetworkState.GOOD: 0.5, NetworkState.DEGRADED: 0.3, NetworkState.POOR: 0.2,
-                NetworkState.UNKNOWN: 0.3}.get(self.state, 0.3)
-
-    @property
-    def budget_safety_margin(self) -> float:
-        """Budget safety margin: 1.0 = no margin, 0.8 = 20% buffer."""
-        return {NetworkState.GOOD: 1.0, NetworkState.DEGRADED: 0.8, NetworkState.POOR: 0.7,
-                NetworkState.UNKNOWN: 0.8}.get(self.state, 0.8)
-
-    @property
     def probe_interval_bw(self) -> float:
         """Recommended bandwidth probe interval for this state."""
         return {NetworkState.GOOD: 10.0, NetworkState.DEGRADED: 5.0, NetworkState.POOR: 5.0,
@@ -153,24 +128,15 @@ class NetworkStateMachine:
     def budget_bytes(self, bw_ewma: float, total_bytes: float = 0.0) -> float:
         """Compute usable budget from bandwidth and target transfer time.
 
-        Formula: budget = bw_ewma * TARGET_TIME
+        Formula: budget = bw_ewma * TARGET_TRANSFER_TIME
         Capped at total_bytes (never exceed original size).
-
-        Note: bw_ewma should come from get_effective_bw() which already
-        applies a confidence-scaled safety margin.
         """
-        TARGET_TIME = 2.0  # target transfer time in seconds
-
         if bw_ewma <= 0:
             return 0.0
-
-        budget = bw_ewma * TARGET_TIME
+        budget = bw_ewma * TARGET_TRANSFER_TIME
         if total_bytes > 0:
             budget = min(budget, total_bytes)
         return budget
-
-    def is_uninitialized(self) -> bool:
-        return self.state == NetworkState.UNKNOWN
 
     def __repr__(self) -> str:
         return (f"NetworkStateMachine(state={self.state.value}, "

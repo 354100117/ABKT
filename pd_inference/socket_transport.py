@@ -14,7 +14,6 @@ from __future__ import annotations
 import io
 import socket
 import struct
-import threading
 import time
 from typing import Any, Callable, Dict, Optional
 

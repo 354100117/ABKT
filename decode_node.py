@@ -38,6 +38,7 @@ from pd_inference.config import PDConfig
 from pd_inference.kv_cache import KVCache, dynamic_cache_fingerprint
 from pd_inference.socket_transport import SocketServer, send_obj, recv_obj
 from pd_inference.utils import decode_tokens, load_tokenizer, get_device
+from backend.config import DEFAULT_PROBE_PORT
 from backend.network_probe import ProbeServer
 from backend.chunked_transfer import ChunkAssembler
 from backend.adaptive_quant import AdaptiveQuantizer
@@ -124,9 +125,9 @@ def main():
     print(f"[decode] Model loaded in {time.time() - t0:.1f}s")
 
     # ── Start probe server (daemon, background thread) ──
-    probe_server = ProbeServer(host="0.0.0.0", port=9877)
+    probe_server = ProbeServer(host="0.0.0.0", port=DEFAULT_PROBE_PORT)
     probe_server.start()
-    print(f"[decode] Probe server started on port 9877")
+    print(f"[decode] Probe server started on port {DEFAULT_PROBE_PORT}")
 
     # ── Load tokenizer ──
     tokenizer = load_tokenizer(config.model_name)

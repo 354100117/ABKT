@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 import threading
-import traceback
 from typing import Dict, List, Optional, Tuple
 
 import torch

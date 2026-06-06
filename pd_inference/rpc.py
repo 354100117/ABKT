@@ -13,7 +13,6 @@ from __future__ import annotations
 import io
 import os
 import pickle
-import queue
 import threading
 from typing import Any, Callable, Dict, Optional
 

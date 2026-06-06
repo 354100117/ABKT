@@ -20,14 +20,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from backend.adaptive_quant import AdaptiveQuantizer
-from backend.precision_allocator import AllocationResult, Precision, BYTES_PER_ELEMENT
+from backend.config import (
+    MIN_CHUNK_SIZE, MAX_CHUNK_SIZE, TIMING_CHECK_INTERVAL, SLOW_THRESHOLD,
+)
+from backend.precision_allocator import Precision
 
 logger = logging.getLogger(__name__)
-
-MIN_CHUNK_SIZE = 16
-MAX_CHUNK_SIZE = 256
-TIMING_CHECK_INTERVAL = 2   # check throughput every N chunks
-SLOW_THRESHOLD = 0.7        # actual_bw < expected * threshold → downgrade
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -109,9 +107,9 @@ class ChunkedSender:
                     total_bytes += chunk_bytes
                     total_chunks += 1
                     if total_chunks % 10 == 0 or end >= seq_len:
-                        print(f"[sender] chunk #{total_chunks} layer={lidx} "
-                              f"[{start}:{end}] {chunk_bytes/1024:.1f}KB "
-                              f"last={end >= seq_len}")
+                        logger.debug("chunk #%d layer=%d [%d:%d] %.1fKB last=%s",
+                                     total_chunks, lidx, start, end,
+                                     chunk_bytes/1024, end >= seq_len)
                     # Send metadata only with the first chunk of each layer
                     include_meta = lidx not in meta_sent
                     msg = {
@@ -147,9 +145,8 @@ class ChunkedSender:
                 sent_layers.add(lidx)
 
         elapsed = time.time() - t_start
-        print(f"[sender] All chunks sent: {total_chunks} chunks, "
-              f"{total_bytes/1e6:.1f} MB in {elapsed:.2f}s "
-              f"({total_bytes/elapsed/1e6:.1f} MB/s)")
+        logger.info("All chunks sent: %d chunks, %.1f MB in %.2f}s (%.1f MB/s)",
+                    total_chunks, total_bytes/1e6, elapsed, total_bytes/elapsed/1e6)
 
     def _check_and_downgrade(
         self,
@@ -173,9 +170,9 @@ class ChunkedSender:
             return None, None
 
         # Bandwidth dropped — downgrade remaining layers
-        print(f"[sender] BW drop detected: actual={actual_bw/1e6:.1f} MB/s "
-              f"< expected*{SLOW_THRESHOLD}={expected_bw*SLOW_THRESHOLD/1e6:.1f} MB/s")
-        print(f"[sender] Downgrading {len(remaining_layers)} remaining layers")
+        logger.warning("BW drop detected: actual=%.1f MB/s < expected*%.1f=%.1f MB/s",
+                       actual_bw/1e6, SLOW_THRESHOLD, expected_bw*SLOW_THRESHOLD/1e6)
+        logger.info("Downgrading %d remaining layers", len(remaining_layers))
 
         new_prec_map = self._downgrade_precision_map(
             self.precision_map, remaining_layers
@@ -219,7 +216,7 @@ class ChunkedSender:
                            for v in prec_tensor if int(v.item()) in {16, 8, 4, 2}):
                         avg_before = int(round(float(prec_tensor.float().mean())))
                         avg_after = int(round(float(new_tensor.float().mean())))
-                        print(f"[sender]   layer {lidx}: avg {avg_before}b → {avg_after}b")
+                        logger.debug("  layer %d: avg %db → %db", lidx, avg_before, avg_after)
                 else:
                     new_map[dnode][lidx] = prec_tensor
         return new_map
@@ -280,29 +277,30 @@ class ChunkAssembler:
             info["chunks"].append((chunk_start, chunk_end, k, v))
             n_chunks = len(info["chunks"])
 
-            print(f"[assembler] chunk layer={layer_idx} [{chunk_start}:{chunk_end}] "
-                  f"chunks_for_layer={n_chunks} is_last={is_last_chunk} "
-                  f"layers_in_buf={len(buf)}/{self.num_layers}")
+            logger.debug("chunk layer=%d [%d:%d] chunks_for_layer=%d is_last=%s "
+                         "layers_in_buf=%d/%d",
+                         layer_idx, chunk_start, chunk_end, n_chunks, is_last_chunk,
+                         len(buf), self.num_layers)
 
             if not is_last_chunk:
                 return None
 
             # Wait for all expected layers before checking completeness
             if self.num_layers > 0 and len(buf) < self.num_layers:
-                print(f"[assembler] Waiting for layers: {len(buf)}/{self.num_layers}")
+                logger.debug("Waiting for layers: %d/%d", len(buf), self.num_layers)
                 return None
 
             # Check all layers complete
             if not all(self._is_complete(info) for info in buf.values()):
                 incomplete = [l for l, info in buf.items() if not self._is_complete(info)]
-                print(f"[assembler] Layers incomplete: {incomplete}")
+                logger.debug("Layers incomplete: %s", incomplete)
                 return None
 
             # All chunks received — assemble and dequantize
-            print(f"[assembler] All {len(buf)} layers complete, assembling...")
+            logger.info("All %d layers complete, assembling...", len(buf))
             t0 = time.time()
             assembled = self._assemble(request_id, buf)
-            print(f"[assembler] Assembled in {time.time() - t0:.3f}s")
+            logger.debug("Assembled in %.3fs", time.time() - t0)
             # Save meta before deleting buffer (we're already under self._lock)
             meta_for_deq = {0: {l: buf[l]["meta"] for l in assembled}}
             del self._buffers[request_id]
@@ -310,16 +308,14 @@ class ChunkAssembler:
         try:
             q = self.quantizer
             t1 = time.time()
-            print(f"[assembler] Dequantizing {len(assembled)} layers...")
+            logger.debug("Dequantizing %d layers...", len(assembled))
             dequantized = q.dequantize({0: assembled}, meta_for_deq)
-            print(f"[assembler] Dequantized in {time.time() - t1:.3f}s")
+            logger.debug("Dequantized in %.3fs", time.time() - t1)
             t2 = time.time()
             self.on_complete(request_id, dequantized)
-            print(f"[assembler] Callback done in {time.time() - t2:.3f}s")
-        except Exception as e:
-            print(f"[assembler] ERROR during assembly/dequant: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.debug("Callback done in %.3fs", time.time() - t2)
+        except Exception:
+            logger.exception("ERROR during assembly/dequant")
         return True
 
     @staticmethod
@@ -343,10 +339,10 @@ class ChunkAssembler:
             for _, _, k_chunk, v_chunk in chunks:
                 k_parts.append(k_chunk)
                 v_parts.append(v_chunk)
-            print(f"[assembler]   layer {lidx}: cat {len(k_parts)} chunks "
-                  f"dtype={k_parts[0].dtype} device={k_parts[0].device}")
+            logger.debug("  layer %d: cat %d chunks dtype=%s device=%s",
+                        lidx, len(k_parts), k_parts[0].dtype, k_parts[0].device)
             result[lidx] = (torch.cat(k_parts, dim=2), torch.cat(v_parts, dim=2))
-        print(f"[assembler] Concatenation done for {len(result)} layers")
+        logger.debug("Concatenation done for %d layers", len(result))
         return result
 
     def cancel(self, request_id: str) -> None:

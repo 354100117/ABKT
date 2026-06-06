@@ -16,41 +16,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from enum import IntEnum
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from backend.config import (
+    Precision, NUM_GROUPS, QUALITY_FIDELITY, BYTES_PER_ELEMENT, PREC_NAMES,
+)
+
 logger = logging.getLogger(__name__)
-
-
-class Precision(IntEnum):
-    FP16 = 16
-    FP8 = 8
-    INT4 = 4
-    INT2 = 2
-
-
-# Offline-calibrated quality fidelity per precision (0..1)
-QUALITY_FIDELITY = {
-    Precision.FP16: 1.00,
-    Precision.FP8: 0.98,
-    Precision.INT4: 0.92,
-    Precision.INT2: 0.80,
-}
-
-# Number of token groups per layer for per-group quantization.
-# Each layer's seq_len is split into NUM_GROUPS groups; the allocator
-# assigns independent precision levels to each group.
-NUM_GROUPS = 4
-
-# Bytes per element per precision
-BYTES_PER_ELEMENT = {
-    Precision.FP16: 2.0,
-    Precision.FP8: 1.0,
-    Precision.INT4: 0.5,
-    Precision.INT2: 0.25,
-}
 
 
 @dataclass
@@ -216,17 +190,17 @@ class PrecisionAllocator:
                 cr = total_fp16 / max(current_bytes, 1)
                 dropped = [lidx for _, _, lidx, _, _ in reversed(entries)]
 
-                prec_names = {16: "FP16", 8: "FP8 ", 4: "INT4", 2: "INT2"}
-                print("[allocator] Budget infeasible — per-group upgrade from INT2")
-                print(f"[allocator]   budget={budget_bytes/1e6:.2f} MB, "
-                      f"INT2_total={int2_total/1e6:.2f} MB")
+                prec_names = PREC_NAMES
+                logger.info("Budget infeasible — per-group upgrade from INT2")
+                logger.info("  budget=%.2f MB, INT2_total=%.2f MB",
+                            budget_bytes/1e6, int2_total/1e6)
                 for imp, dnode, lidx, gi, elem_cnt in entries:
                     final_p = assignments[(dnode, lidx, gi)]
                     final_name = prec_names.get(final_p.value, "????")
                     g_bytes = BYTES_PER_ELEMENT[final_p] * elem_cnt
                     tag = "↑ upgraded" if final_p.value > 2 else "= INT2"
-                    print(f"[allocator]   layer {lidx:2d} g{gi}: imp={imp:.3f} → {final_name}  "
-                          f"({g_bytes/1024:.0f} KB)  {tag}")
+                    logger.debug("  layer %2d g%d: imp=%.3f → %s  (%d KB)  %s",
+                                lidx, gi, imp, final_name, g_bytes/1024, tag)
 
                 # Metadata overhead: per-group scales
                 meta_overhead = 0.0
@@ -251,13 +225,13 @@ class PrecisionAllocator:
                     dropped_layers=dropped,
                 )
             else:
-                prec_names = {16: "FP16", 8: "FP8 ", 4: "INT4", 2: "INT2"}
-                print("[allocator] Budget infeasible — all layers at INT2")
-                print(f"[allocator]   budget={budget_bytes/1e6:.2f} MB, "
-                      f"INT2_total={int2_total/1e6:.2f} MB")
+                prec_names = PREC_NAMES
+                logger.info("Budget infeasible — all layers at INT2")
+                logger.info("  budget=%.2f MB, INT2_total=%.2f MB",
+                            budget_bytes/1e6, int2_total/1e6)
                 for imp, dnode, lidx, gi, elem_cnt in entries:
-                    print(f"[allocator]   layer {lidx:2d} g{gi}: imp={imp:.3f} → INT2 "
-                          f"({elem_cnt * BYTES_PER_ELEMENT[Precision.INT2]/1024:.0f} KB)")
+                    logger.debug("  layer %2d g%d: imp=%.3f → INT2 (%d KB)",
+                                lidx, gi, imp, elem_cnt * BYTES_PER_ELEMENT[Precision.INT2]/1024)
                 dropped = [lidx for _, _, lidx, _, _ in reversed(entries)]
                 int2_map = self._uniform_map(kv_cache, Precision.INT2)
                 int2_meta = self.metadata_bytes(kv_cache, Precision.INT2)
@@ -314,9 +288,9 @@ class PrecisionAllocator:
                     break
 
         # Log per-group allocation decisions
-        print(f"[allocator] === Per-Group Precision Allocation (N={NUM_GROUPS}) ===")
-        print(f"[allocator] Budget: {budget_bytes/1e6:.2f} MB, FP16 total: {total_fp16/1e6:.2f} MB")
-        prec_names = {16: "FP16", 8: "FP8 ", 4: "INT4", 2: "INT2"}
+        logger.info("=== Per-Group Precision Allocation (N=%d) ===", NUM_GROUPS)
+        logger.info("Budget: %.2f MB, FP16 total: %.2f MB", budget_bytes/1e6, total_fp16/1e6)
+        prec_names = PREC_NAMES
         for imp, dnode, lidx, gi, elem_cnt in entries:
             min_p = entry_min_prec[(dnode, lidx)]
             final_p = assignments[(dnode, lidx, gi)]
@@ -329,8 +303,9 @@ class PrecisionAllocator:
                 tag = "↓ downgraded"
             else:
                 tag = "= min"
-            print(f"[allocator]   layer {lidx:2d} g{gi}: imp={imp:.3f}  min={min_name}  → {final_name}  ({g_bytes/1024:5.0f} KB)  {tag}")
-        print("[allocator] === End Allocation ===")
+            logger.debug("  layer %2d g%d: imp=%.3f  min=%s  → %s  (%5d KB)  %s",
+                        lidx, gi, imp, min_name, final_name, g_bytes/1024, tag)
+        logger.info("=== End Allocation ===")
 
         # Build output precision_map: {dnode: {lidx: tensor[NUM_GROUPS]}}
         precision_map: Dict[int, Dict[int, torch.Tensor]] = {}
