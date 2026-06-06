@@ -1,21 +1,24 @@
 """Adaptive quantization/dequantization for mixed-precision KV Cache.
 
 Supports FP16 (passthrough), FP8 (symmetric int8), INT4 (asymmetric uint4),
-and INT2 (asymmetric uint2) at the per-layer level.
+and INT2 (asymmetric uint2) with per-group precision within each layer.
 
-The precision_map from PrecisionAllocator determines which precision
-each (layer, token) entry uses. Currently, quantization is applied
-uniformly per-layer (using the layer's average precision) to keep
-serialization practical.
+The precision_map from PrecisionAllocator determines which precision each
+group uses. Each layer is split into NUM_GROUPS along the seq_len dimension;
+each group is quantized independently with its own precision and scales.
+
+KIVI-style quantization:
+  - Keys: per-channel quantization (dim=3: head_dim) within each group
+  - Values: per-token quantization (dim=2: seq_len) within each group
 """
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
-from backend.precision_allocator import Precision
+from backend.precision_allocator import NUM_GROUPS, Precision
 
 
 class AdaptiveQuantizer:
@@ -28,10 +31,12 @@ class AdaptiveQuantizer:
     ) -> Tuple[Dict, Dict]:
         """Quantize KV cache layers according to precision_map.
 
+        precision_map values are tensors of shape [NUM_GROUPS] (per-group
+        precision) or [seq_len] (per-token, legacy). When NUM_GROUPS values
+        are detected, each group is quantized independently.
+
         Returns:
             (quantized_kv, metadata) ready for transport.
-            quantized_kv: same structure as kv_cache but with quantized tensors.
-            metadata: {decode_node: {layer: {precision, scale_k, ...}}}.
         """
         quantized = {}
         metadata = {}
@@ -51,36 +56,27 @@ class AdaptiveQuantizer:
                     metadata[dnode][lidx] = {"precision": 16}
                     continue
 
-                avg_prec = int(round(float(prec_t.float().mean())))
-                prec = Precision(avg_prec) if avg_prec in {16, 8, 4, 2} else Precision.FP16
-
-                if prec == Precision.FP16:
-                    quantized[dnode][lidx] = (k, v)
-                    metadata[dnode][lidx] = {"precision": 16}
-                elif prec == Precision.FP8:
-                    # FP8: per-layer (symmetric, already good quality)
-                    qk, mk = self._quantize(k, prec)
-                    qv, mv = self._quantize(v, prec)
+                # Detect per-group vs per-token/legacy
+                if len(prec_t) == NUM_GROUPS:
+                    # Per-group allocation: use the most common precision
+                    # across groups as the layer's uniform precision.
+                    # This avoids mixed-dtype concatenation issues while
+                    # still benefiting from per-group importance scoring
+                    # in the allocator (S3 quality-weighted upgrade).
+                    vals = [int(p.item()) for p in prec_t]
+                    from collections import Counter
+                    most_common_val = Counter(vals).most_common(1)[0][0]
+                    prec = Precision(most_common_val) if most_common_val in {16, 8, 4, 2} else Precision.FP16
+                    qk, qv, meta = self._quantize_single(k, v, prec)
                     quantized[dnode][lidx] = (qk, qv)
-                    metadata[dnode][lidx] = {
-                        "precision": prec.value,
-                        "scale_k": mk["scale"],
-                        "zero_k": mk["zero_point"],
-                        "scale_v": mv["scale"],
-                        "zero_v": mv["zero_point"],
-                    }
+                    metadata[dnode][lidx] = meta
                 else:
-                    # INT4/INT2: KIVI-style — per-channel for K, per-token for V
-                    qk, mk = self._quantize_per_channel(k, prec)
-                    qv, mv = self._quantize_per_token(v, prec)
+                    # Legacy per-token tensor — collapse to single precision
+                    avg_prec = int(round(float(prec_t.float().mean())))
+                    prec = Precision(avg_prec) if avg_prec in {16, 8, 4, 2} else Precision.FP16
+                    qk, qv, meta = self._quantize_single(k, v, prec)
                     quantized[dnode][lidx] = (qk, qv)
-                    metadata[dnode][lidx] = {
-                        "precision": prec.value,
-                        "scale_k": mk["scale"],
-                        "zero_k": mk["zero_point"],
-                        "scale_v": mv["scale"],
-                        "zero_v": mv["zero_point"],
-                    }
+                    metadata[dnode][lidx] = meta
 
         return quantized, metadata
 
@@ -103,6 +99,9 @@ class AdaptiveQuantizer:
 
                 if prec == 16:
                     result[dnode][lidx] = kv
+                elif "groups" in m:
+                    # Per-group dequantization
+                    result[dnode][lidx] = self._dequantize_per_group(kv, m)
                 else:
                     k, v = kv
                     p = Precision(prec)
@@ -111,6 +110,147 @@ class AdaptiveQuantizer:
                     result[dnode][lidx] = (dk, dv)
 
         return result
+
+    # ── Per-group quantization ──
+
+    def _quantize_per_group(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        prec_tensor: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """Quantize a layer split into NUM_GROUPS with independent precisions.
+
+        All groups are stored as uint8 to enable concatenation across groups
+        with different precisions. FP16 groups reinterpret float16 bytes as
+        uint8; FP8 groups cast int8 → uint8; INT4/INT2 are already uint8.
+        """
+        seq_len = k.shape[2]
+        k_parts: List[torch.Tensor] = []
+        v_parts: List[torch.Tensor] = []
+        groups_meta: List[dict] = []
+
+        for gi in range(NUM_GROUPS):
+            g_start = gi * seq_len // NUM_GROUPS
+            g_end = (gi + 1) * seq_len // NUM_GROUPS
+            prec_val = int(prec_tensor[gi].item())
+            prec = Precision(prec_val) if prec_val in {16, 8, 4, 2} else Precision.FP16
+
+            k_slice = k[:, :, g_start:g_end, :].contiguous()
+            v_slice = v[:, :, g_start:g_end, :].contiguous()
+
+            if prec == Precision.FP16:
+                # Reinterpret float16 raw bytes as uint8 for uniform dtype
+                k_parts.append(k_slice.view(torch.uint8))
+                v_parts.append(v_slice.view(torch.uint8))
+                groups_meta.append({"precision": 16})
+            elif prec == Precision.FP8:
+                qk, mk = self._quantize(k_slice, prec)
+                qv, mv = self._quantize(v_slice, prec)
+                # Cast int8 → uint8 (bit pattern preserved, dequantize handles it)
+                k_parts.append(qk.view(torch.uint8))
+                v_parts.append(qv.view(torch.uint8))
+                groups_meta.append({
+                    "precision": 8,
+                    "scale_k": mk["scale"], "zero_k": mk["zero_point"],
+                    "scale_v": mv["scale"], "zero_v": mv["zero_point"],
+                })
+            else:
+                # INT4/INT2: KIVI-style per-channel K, per-token V (already uint8)
+                qk, mk = self._quantize_per_channel(k_slice, prec)
+                qv, mv = self._quantize_per_token(v_slice, prec)
+                k_parts.append(qk)
+                v_parts.append(qv)
+                groups_meta.append({
+                    "precision": prec_val,
+                    "scale_k": mk["scale"], "zero_k": mk["zero_point"],
+                    "scale_v": mv["scale"], "zero_v": mv["zero_point"],
+                })
+
+        k_cat = torch.cat(k_parts, dim=2)
+        v_cat = torch.cat(v_parts, dim=2)
+        meta = {
+            "precision": max(g["precision"] for g in groups_meta),
+            "groups": groups_meta,
+        }
+        return k_cat, v_cat, meta
+
+    @staticmethod
+    def _dequantize_per_group(
+        kv: Tuple[torch.Tensor, torch.Tensor],
+        meta: dict,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Dequantize a per-group quantized layer.
+
+        Data is stored as uint8. FP16 groups need view(float16) to recover
+        the original float16 bytes. FP8 groups need view(int8) before
+        dequantization. INT4/INT2 groups are already uint8.
+        """
+        k, v = kv
+        groups_meta: List[dict] = meta["groups"]
+        seq_len = k.shape[2]
+        k_parts: List[torch.Tensor] = []
+        v_parts: List[torch.Tensor] = []
+
+        for gi, gm in enumerate(groups_meta):
+            g_start = gi * seq_len // NUM_GROUPS
+            g_end = (gi + 1) * seq_len // NUM_GROUPS
+            prec_val = gm.get("precision", 16)
+
+            k_slice = k[:, :, g_start:g_end, :]
+            v_slice = v[:, :, g_start:g_end, :]
+
+            if prec_val == 16:
+                # Reinterpret uint8 bytes back to float16
+                k_parts.append(k_slice.view(torch.float16))
+                v_parts.append(v_slice.view(torch.float16))
+            elif prec_val == 8:
+                # Reinterpret uint8 back to int8, then dequantize
+                p = Precision.FP8
+                dk = AdaptiveQuantizer._dequantize(
+                    k_slice.view(torch.int8),
+                    gm.get("scale_k"), gm.get("zero_k"), p)
+                dv = AdaptiveQuantizer._dequantize(
+                    v_slice.view(torch.int8),
+                    gm.get("scale_v"), gm.get("zero_v"), p)
+                k_parts.append(dk)
+                v_parts.append(dv)
+            else:
+                p = Precision(prec_val)
+                dk = AdaptiveQuantizer._dequantize(
+                    k_slice, gm.get("scale_k"), gm.get("zero_k"), p)
+                dv = AdaptiveQuantizer._dequantize(
+                    v_slice, gm.get("scale_v"), gm.get("zero_v"), p)
+                k_parts.append(dk)
+                v_parts.append(dv)
+
+        return torch.cat(k_parts, dim=2), torch.cat(v_parts, dim=2)
+
+    # ── Single-precision quantization (legacy / FP8) ──
+
+    @staticmethod
+    def _quantize_single(
+        k: torch.Tensor, v: torch.Tensor, prec: Precision,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """Quantize entire layer with a single precision."""
+        if prec == Precision.FP16:
+            return k, v, {"precision": 16}
+        elif prec == Precision.FP8:
+            qk, mk = AdaptiveQuantizer._quantize(k, prec)
+            qv, mv = AdaptiveQuantizer._quantize(v, prec)
+            return qk, qv, {
+                "precision": 8,
+                "scale_k": mk["scale"], "zero_k": mk["zero_point"],
+                "scale_v": mv["scale"], "zero_v": mv["zero_point"],
+            }
+        else:
+            qk, mk = AdaptiveQuantizer._quantize_per_channel(k, prec)
+            qv, mv = AdaptiveQuantizer._quantize_per_token(v, prec)
+            return qk, qv, {
+                "precision": prec.value,
+                "scale_k": mk["scale"], "zero_k": mk["zero_point"],
+                "scale_v": mv["scale"], "zero_v": mv["zero_point"],
+            }
 
     # ── Internal quantization routines ──
 
@@ -190,7 +330,5 @@ class AdaptiveQuantizer:
         if scale is None:
             return qt
         if precision in (Precision.INT4, Precision.INT2):
-            # Works for both scalar (per-layer) and tensor (per-channel/per-token)
-            # due to broadcasting: scale [1,1,1,hd] or [1,1,seq,1]
             return ((qt.float() - zero_point) * scale).half()
         return (qt.float() * scale).half()

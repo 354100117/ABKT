@@ -297,7 +297,7 @@ class NetworkProbeClient:
         measured_bw = compressed_bytes * compression_ratio / elapsed_sec
         with self._lock:
             self._bw_window.append(measured_bw)
-            self._bw_transfer_ewma.update(measured_bw)
+            self._bw_transfer_ewma.update_clamped(measured_bw, max_change=EWMA_MAX_CHANGE)
             self._transfer_count += 1
             self._calibrated = True
 

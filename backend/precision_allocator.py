@@ -39,6 +39,11 @@ QUALITY_FIDELITY = {
     Precision.INT2: 0.80,
 }
 
+# Number of token groups per layer for per-group quantization.
+# Each layer's seq_len is split into NUM_GROUPS groups; the allocator
+# assigns independent precision levels to each group.
+NUM_GROUPS = 4
+
 # Bytes per element per precision
 BYTES_PER_ELEMENT = {
     Precision.FP16: 2.0,
@@ -53,7 +58,7 @@ class AllocationResult:
     """Result of precision allocation.
 
     Attributes:
-        precision_map: {decode_node: {layer_idx: precision_tensor[seq_len]}}.
+        precision_map: {decode_node: {layer_idx: precision_tensor[NUM_GROUPS]}}.
         total_bytes: Total bytes after allocation.
         budget_bytes: Budget provided.
         avg_precision_bits: Weighted average bits per element.
@@ -97,7 +102,10 @@ class PrecisionAllocator:
         budget_bytes: float,
         num_layers_total: int = 0,
     ) -> AllocationResult:
-        """Allocate precision levels under a byte budget.
+        """Allocate precision levels under a byte budget (per-group granularity).
+
+        Each layer's seq_len is split into NUM_GROUPS groups. The allocator
+        assigns independent precision levels to each group based on importance.
 
         Args:
             importance_map: {decode_node: {layer: importance[seq_len]}} values in [0,1].
@@ -105,47 +113,63 @@ class PrecisionAllocator:
             budget_bytes: Maximum bytes allowed for the transfer.
             num_layers_total: Total layers in model. When > 0, enables per-layer
                 minimum precision constraints (bottom 1/3: FP8, middle: INT4, top: INT2).
-                When 0 (default), falls back to global FP8 minimum for backward compat.
 
         Returns:
-            AllocationResult with precision_map and statistics.
-            If budget < minimum floor, returns feasible=False with suggested dropped layers.
+            AllocationResult with precision_map as {dnode: {lidx: tensor[NUM_GROUPS]}}.
         """
         total_fp16 = self._total_bytes(kv_cache, Precision.FP16)
 
         if budget_bytes >= total_fp16 or not kv_cache:
-            # Budget ample → uniform FP16
             prec_map = self._uniform_map(kv_cache, Precision.FP16)
             return AllocationResult(prec_map, total_fp16, budget_bytes,
                                     16.0, 1.0)
 
-        # Build entry list: (importance, decode_node, layer_idx, element_count)
-        entries: List[Tuple[float, int, int, int]] = []
+        # Build per-group entry list:
+        # (importance, decode_node, layer_idx, group_idx, element_count)
+        entries: List[Tuple[float, int, int, int, int]] = []
         for dnode, layer_cache in kv_cache.items():
             imp_map = importance_map.get(dnode, {})
             for lidx, kv in layer_cache.items():
                 if kv is None:
                     continue
                 k, v = kv
-                elem_count = k.numel() + v.numel()
+                seq_len = k.shape[2]
+                # Per-token element count (everything except seq dim)
+                k_per_token = k.numel() // seq_len
+                v_per_token = v.numel() // seq_len
                 imp = imp_map.get(lidx)
-                avg_imp = float(imp.mean().item()) if imp is not None else 0.5
-                entries.append((avg_imp, dnode, lidx, elem_count))
+                for gi in range(NUM_GROUPS):
+                    g_start = gi * seq_len // NUM_GROUPS
+                    g_end = (gi + 1) * seq_len // NUM_GROUPS
+                    group_size = g_end - g_start
+                    elem_count = group_size * (k_per_token + v_per_token)
+                    if imp is not None:
+                        avg_imp = float(imp[g_start:g_end].mean().item())
+                    else:
+                        avg_imp = 0.5
+                    entries.append((avg_imp, dnode, lidx, gi, elem_count))
 
         entries.sort(key=lambda x: x[0], reverse=True)
 
-        # Compute per-layer minimum floor (or global FP8 floor for backward compat)
+        # Compute minimum floor (per-group, using layer-level min precision)
         min_floor = 0.0
         for dnode, layer_cache in kv_cache.items():
             for lidx, kv in layer_cache.items():
                 if kv is None:
                     continue
                 k, v = kv
-                elem_count = k.numel() + v.numel()
+                seq_len = k.shape[2]
+                k_per_token = k.numel() // seq_len
+                v_per_token = v.numel() // seq_len
                 min_prec = self._min_precision_for_layer(lidx, num_layers_total, 999)
-                min_floor += elem_count * BYTES_PER_ELEMENT[min_prec]
+                for gi in range(NUM_GROUPS):
+                    g_start = gi * seq_len // NUM_GROUPS
+                    g_end = (gi + 1) * seq_len // NUM_GROUPS
+                    group_size = g_end - g_start
+                    elem_count = group_size * (k_per_token + v_per_token)
+                    min_floor += elem_count * BYTES_PER_ELEMENT[min_prec]
 
-        # Budget below minimum floor — importance-based allocation
+        # Budget below minimum floor
         if budget_bytes < min_floor:
             int2_total = self._total_bytes(kv_cache, Precision.INT2)
             logger.warning(
@@ -155,22 +179,22 @@ class PrecisionAllocator:
             )
 
             if int2_total <= budget_bytes:
-                # INT2 fits within budget — upgrade important layers
-                assignments: Dict[Tuple[int, int], Precision] = {}
+                # INT2 fits — upgrade important groups
+                assignments: Dict[Tuple[int, int, int], Precision] = {}
                 current_bytes = 0.0
-                for _, dnode, lidx, elem_cnt in entries:
-                    assignments[(dnode, lidx)] = Precision.INT2
+                for _, dnode, lidx, gi, elem_cnt in entries:
+                    assignments[(dnode, lidx, gi)] = Precision.INT2
                     current_bytes += BYTES_PER_ELEMENT[Precision.INT2] * elem_cnt
 
                 prec_order = self._sorted_precisions
-                for imp, dnode, lidx, elem_cnt in entries:
-                    cur_prec = assignments[(dnode, lidx)]
+                for imp, dnode, lidx, gi, elem_cnt in entries:
+                    cur_prec = assignments[(dnode, lidx, gi)]
                     cur_idx = prec_order.index(cur_prec)
                     for upgrade_idx in range(cur_idx - 1, -1, -1):
                         target = prec_order[upgrade_idx]
                         cost = (BYTES_PER_ELEMENT[target] - BYTES_PER_ELEMENT[cur_prec]) * elem_cnt
                         if current_bytes + cost <= budget_bytes + 1e-6:
-                            assignments[(dnode, lidx)] = target
+                            assignments[(dnode, lidx, gi)] = target
                             current_bytes += cost
                             cur_prec = target
                         else:
@@ -182,36 +206,38 @@ class PrecisionAllocator:
                     for lidx, kv in layer_cache.items():
                         if kv is None:
                             continue
-                        prec = assignments.get((dnode, lidx), Precision.INT2)
-                        seq_len = kv[0].shape[2]
-                        precision_map[dnode][lidx] = torch.full(
-                            (seq_len,), prec.value, dtype=torch.int8
-                        )
+                        prec_tensor = torch.tensor([
+                            assignments.get((dnode, lidx, gi), Precision.INT2).value
+                            for gi in range(NUM_GROUPS)
+                        ], dtype=torch.int8)
+                        precision_map[dnode][lidx] = prec_tensor
 
                 avg_bits = self._avg_precision(precision_map)
                 cr = total_fp16 / max(current_bytes, 1)
-                dropped = [lidx for _, _, lidx, _ in reversed(entries)]
+                dropped = [lidx for _, _, lidx, _, _ in reversed(entries)]
 
                 prec_names = {16: "FP16", 8: "FP8 ", 4: "INT4", 2: "INT2"}
-                print("[allocator] Budget infeasible — importance-based upgrade from INT2")
+                print("[allocator] Budget infeasible — per-group upgrade from INT2")
                 print(f"[allocator]   budget={budget_bytes/1e6:.2f} MB, "
                       f"INT2_total={int2_total/1e6:.2f} MB")
-                for imp, dnode, lidx, elem_cnt in entries:
-                    final_p = assignments[(dnode, lidx)]
+                for imp, dnode, lidx, gi, elem_cnt in entries:
+                    final_p = assignments[(dnode, lidx, gi)]
                     final_name = prec_names.get(final_p.value, "????")
-                    layer_bytes = BYTES_PER_ELEMENT[final_p] * elem_cnt
+                    g_bytes = BYTES_PER_ELEMENT[final_p] * elem_cnt
                     tag = "↑ upgraded" if final_p.value > 2 else "= INT2"
-                    print(f"[allocator]   layer {lidx:2d}: imp={imp:.3f} → {final_name}  "
-                          f"({layer_bytes/1024:.0f} KB)  {tag}")
+                    print(f"[allocator]   layer {lidx:2d} g{gi}: imp={imp:.3f} → {final_name}  "
+                          f"({g_bytes/1024:.0f} KB)  {tag}")
 
-                # Add metadata overhead
+                # Metadata overhead: per-group scales
                 meta_overhead = 0.0
-                for (dn, li), p in assignments.items():
+                for (dn, li, gi), p in assignments.items():
                     if p in (Precision.INT4, Precision.INT2):
                         kv = kv_cache.get(dn, {}).get(li)
                         if kv is not None:
                             k, _ = kv
-                            meta_overhead += (k.shape[3] + k.shape[2]) * 4.0
+                            seq_len = k.shape[2]
+                            g_size = (gi + 1) * seq_len // NUM_GROUPS - gi * seq_len // NUM_GROUPS
+                            meta_overhead += (k.shape[3] + g_size) * 4.0
                 current_bytes += meta_overhead
 
                 return AllocationResult(
@@ -225,16 +251,14 @@ class PrecisionAllocator:
                     dropped_layers=dropped,
                 )
             else:
-                # INT2 total exceeds budget — return all layers at INT2.
-                # Caller will check transfer time and decide whether to proceed.
                 prec_names = {16: "FP16", 8: "FP8 ", 4: "INT4", 2: "INT2"}
                 print("[allocator] Budget infeasible — all layers at INT2")
                 print(f"[allocator]   budget={budget_bytes/1e6:.2f} MB, "
                       f"INT2_total={int2_total/1e6:.2f} MB")
-                for imp, dnode, lidx, elem_cnt in entries:
-                    print(f"[allocator]   layer {lidx:2d}: imp={imp:.3f} → INT2 "
+                for imp, dnode, lidx, gi, elem_cnt in entries:
+                    print(f"[allocator]   layer {lidx:2d} g{gi}: imp={imp:.3f} → INT2 "
                           f"({elem_cnt * BYTES_PER_ELEMENT[Precision.INT2]/1024:.0f} KB)")
-                dropped = [lidx for _, _, lidx, _ in reversed(entries)]
+                dropped = [lidx for _, _, lidx, _, _ in reversed(entries)]
                 int2_map = self._uniform_map(kv_cache, Precision.INT2)
                 int2_meta = self.metadata_bytes(kv_cache, Precision.INT2)
                 return AllocationResult(
@@ -250,84 +274,88 @@ class PrecisionAllocator:
 
         compression_needed = total_fp16 / max(budget_bytes, 1)
 
-        # Compute per-entry minimum precision (per-layer if num_layers_total > 0,
-        # else global FP8 fallback for backward compat)
+        # Per-group minimum precision (uses layer-level constraint)
         entry_min_prec: Dict[Tuple[int, int], Precision] = {}
-        for _, dnode, lidx, _ in entries:
-            layer_min = self._min_precision_for_layer(lidx, num_layers_total, compression_needed)
-            # Backward compat: when num_layers_total=0, _min_precision_for_layer
-            # returns FP8, so this is equivalent to the old global minimum.
-            entry_min_prec[(dnode, lidx)] = layer_min
+        for _, dnode, lidx, _, _ in entries:
+            key = (dnode, lidx)
+            if key not in entry_min_prec:
+                entry_min_prec[key] = self._min_precision_for_layer(
+                    lidx, num_layers_total, compression_needed)
 
-        # Init all at their per-entry minimum precision
-        current = {}
-        for entry in entries:
-            _, dnode, lidx, elem_cnt = entry
+        # Init all groups at their layer's minimum precision
+        assignments: Dict[Tuple[int, int, int], Precision] = {}
+        current_bytes = 0.0
+        for _, dnode, lidx, gi, elem_cnt in entries:
             prec = entry_min_prec[(dnode, lidx)]
-            current[entry] = BYTES_PER_ELEMENT[prec] * elem_cnt
-        current_bytes = sum(current.values())
-        assignments: Dict[Tuple[int, int], Precision] = {}
-        for _, dnode, lidx, _ in entries:
-            assignments[(dnode, lidx)] = entry_min_prec[(dnode, lidx)]
+            assignments[(dnode, lidx, gi)] = prec
+            current_bytes += BYTES_PER_ELEMENT[prec] * elem_cnt
 
-        # Greedy upgrade by importance
+        # Greedy upgrade by importance × quality gain (per-group)
         prec_order = self._sorted_precisions  # [FP16, FP8, INT4, INT2]
-        for imp, dnode, lidx, elem_cnt in entries:
-            cur_prec = assignments[(dnode, lidx)]
+        def _upgrade_benefit(entry):
+            imp, dnode, lidx, gi, _ = entry
+            cur_prec = assignments[(dnode, lidx, gi)]
+            quality_gain = QUALITY_FIDELITY[Precision.FP16] - QUALITY_FIDELITY[cur_prec]
+            return imp * quality_gain
+
+        sorted_entries = sorted(entries, key=_upgrade_benefit, reverse=True)
+        for imp, dnode, lidx, gi, elem_cnt in sorted_entries:
+            cur_prec = assignments[(dnode, lidx, gi)]
             cur_idx = prec_order.index(cur_prec)
 
             for upgrade_idx in range(cur_idx - 1, -1, -1):
                 target = prec_order[upgrade_idx]
                 cost = (BYTES_PER_ELEMENT[target] - BYTES_PER_ELEMENT[cur_prec]) * elem_cnt
                 if current_bytes + cost <= budget_bytes + 1e-6:
-                    assignments[(dnode, lidx)] = target
+                    assignments[(dnode, lidx, gi)] = target
                     current_bytes += cost
                     cur_prec = target
                 else:
                     break
 
-        # Log per-layer allocation decisions
-        print("[allocator] === Per-Layer Precision Allocation ===")
+        # Log per-group allocation decisions
+        print(f"[allocator] === Per-Group Precision Allocation (N={NUM_GROUPS}) ===")
         print(f"[allocator] Budget: {budget_bytes/1e6:.2f} MB, FP16 total: {total_fp16/1e6:.2f} MB")
         prec_names = {16: "FP16", 8: "FP8 ", 4: "INT4", 2: "INT2"}
-        for imp, dnode, lidx, elem_cnt in entries:
+        for imp, dnode, lidx, gi, elem_cnt in entries:
             min_p = entry_min_prec[(dnode, lidx)]
-            final_p = assignments[(dnode, lidx)]
+            final_p = assignments[(dnode, lidx, gi)]
             min_name = prec_names.get(min_p.value, "????")
             final_name = prec_names.get(final_p.value, "????")
-            layer_bytes = BYTES_PER_ELEMENT[final_p] * elem_cnt
+            g_bytes = BYTES_PER_ELEMENT[final_p] * elem_cnt
             if final_p.value > min_p.value:
                 tag = f"↑ upgraded {min_name}→{final_name}"
             elif final_p.value < min_p.value:
                 tag = "↓ downgraded"
             else:
                 tag = "= min"
-            print(f"[allocator]   layer {lidx:2d}: imp={imp:.3f}  min={min_name}  → {final_name}  ({layer_bytes/1024:5.0f} KB)  {tag}")
+            print(f"[allocator]   layer {lidx:2d} g{gi}: imp={imp:.3f}  min={min_name}  → {final_name}  ({g_bytes/1024:5.0f} KB)  {tag}")
         print("[allocator] === End Allocation ===")
 
-        # Build output precision_map
+        # Build output precision_map: {dnode: {lidx: tensor[NUM_GROUPS]}}
         precision_map: Dict[int, Dict[int, torch.Tensor]] = {}
         for dnode, layer_cache in kv_cache.items():
             precision_map[dnode] = {}
             for lidx, kv in layer_cache.items():
                 if kv is None:
                     continue
-                prec = assignments.get((dnode, lidx), entry_min_prec.get((dnode, lidx), Precision.FP8))
-                seq_len = kv[0].shape[2]
-                precision_map[dnode][lidx] = torch.full(
-                    (seq_len,), prec.value, dtype=torch.int8
-                )
+                prec_tensor = torch.tensor([
+                    assignments.get((dnode, lidx, gi),
+                                    entry_min_prec.get((dnode, lidx), Precision.FP8)).value
+                    for gi in range(NUM_GROUPS)
+                ], dtype=torch.int8)
+                precision_map[dnode][lidx] = prec_tensor
 
-        # Add metadata overhead (KIVI scale/zero tensors) to total_bytes
+        # Metadata overhead: per-group KIVI scale/zero tensors
         meta_overhead = 0.0
-        for (dnode, lidx), prec in assignments.items():
+        for (dnode, lidx, gi), prec in assignments.items():
             if prec in (Precision.INT4, Precision.INT2):
                 kv = kv_cache.get(dnode, {}).get(lidx)
                 if kv is not None:
                     k, _ = kv
-                    head_dim = k.shape[3]
                     seq_len = k.shape[2]
-                    meta_overhead += (head_dim + seq_len) * 4.0
+                    g_size = (gi + 1) * seq_len // NUM_GROUPS - gi * seq_len // NUM_GROUPS
+                    meta_overhead += (k.shape[3] + g_size) * 4.0
         current_bytes += meta_overhead
 
         avg_bits = self._avg_precision(precision_map)
@@ -357,9 +385,10 @@ class PrecisionAllocator:
     ) -> float:
         """Estimate serialization metadata size for KIVI quantization.
 
-        For INT4/INT2: per-channel scale/zero for K, per-token scale/zero for V.
-        Each scale/zero is a float16 tensor → 2 bytes per element.
-        Total per layer: (head_dim + seq_len) × 4 bytes.
+        For INT4/INT2 with per-group quantization:
+          Each group has per-channel scale/zero for K and per-token scale/zero for V.
+          Per group: (head_dim + group_seq_len) × 4 bytes.
+          Total per layer: NUM_GROUPS × (head_dim + seq_len/NUM_GROUPS) × 4 bytes.
 
         For FP8: scalar scale/zero → ~8 bytes per layer (negligible).
         For FP16: 0 bytes.
@@ -367,11 +396,10 @@ class PrecisionAllocator:
         if precision in (Precision.FP16,):
             return 0.0
         if precision == Precision.FP8:
-            # Scalar scale + zero_point for K and V → 4 scalars × 2 bytes
             count = sum(1 for lc in kv_cache.values()
                         for kv in lc.values() if kv is not None)
             return count * 8.0
-        # INT4 / INT2: per-channel K scales + per-token V scales
+        # INT4 / INT2: per-group, per-channel K scales + per-token V scales
         total = 0.0
         for layer_cache in kv_cache.values():
             for kv in layer_cache.values():
@@ -380,9 +408,11 @@ class PrecisionAllocator:
                 k, v = kv
                 head_dim = k.shape[3]
                 seq_len = k.shape[2]
-                # scale_k + zero_k: [1,1,1,head_dim] × 2 tensors × 2 bytes
-                # scale_v + zero_v: [1,1,seq_len,1] × 2 tensors × 2 bytes
-                total += (head_dim + seq_len) * 4.0
+                for gi in range(NUM_GROUPS):
+                    g_start = gi * seq_len // NUM_GROUPS
+                    g_end = (gi + 1) * seq_len // NUM_GROUPS
+                    g_size = g_end - g_start
+                    total += (head_dim + g_size) * 4.0
         return total
 
     @staticmethod
@@ -423,15 +453,15 @@ class PrecisionAllocator:
 
     @staticmethod
     def _uniform_map(kv_cache, precision: Precision):
+        """Build precision_map with per-group tensors (shape [NUM_GROUPS])."""
         prec_map = {}
         for dnode, layer_cache in kv_cache.items():
             prec_map[dnode] = {}
             for lidx, kv in layer_cache.items():
                 if kv is None:
                     continue
-                seq_len = kv[0].shape[2]
                 prec_map[dnode][lidx] = torch.full(
-                    (seq_len,), precision.value, dtype=torch.int8
+                    (NUM_GROUPS,), precision.value, dtype=torch.int8
                 )
         return prec_map
 

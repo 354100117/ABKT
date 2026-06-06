@@ -121,6 +121,7 @@ def run_prefill_turn(
             input_ids_t,
             attention_mask=attn_mask,
             use_cache=True,
+            output_attentions=True,
         )
 
     prefill_time = time.time() - t_prefill
@@ -152,9 +153,16 @@ def run_prefill_turn(
     # Step 1: Convert to ABKT format
     abkt_kv = kv_cache.to_abkt_dict()
 
-    # Step 2: Evaluate token importance
+    # Step 2: Evaluate token importance (3D scoring with attention weights)
+    # Merge attention weights from all layers: mean over layers, keep [batch, heads, seq, seq]
+    attn_weights = None
+    if hasattr(outputs, 'attentions') and outputs.attentions:
+        # outputs.attentions: tuple of [batch, heads, seq, seq] per layer
+        attn_weights = torch.stack(outputs.attentions).mean(dim=0)  # [batch, heads, seq, seq]
+        print(f"[prefill] Attention weights captured: {attn_weights.shape}")
     evaluator = TokenImportanceEvaluator()
-    importance_map = evaluator.compute(abkt_kv, num_layers, kv_cache.seq_len)
+    importance_map = evaluator.compute(abkt_kv, num_layers, kv_cache.seq_len,
+                                       attention_weights=attn_weights)
 
     # Step 3: Get network snapshot and compute dynamic budget
     total_fp16 = PrecisionAllocator._total_bytes(abkt_kv, Precision.FP16)

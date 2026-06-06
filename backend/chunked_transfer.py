@@ -113,7 +113,6 @@ class ChunkedSender:
                               f"[{start}:{end}] {chunk_bytes/1024:.1f}KB "
                               f"last={end >= seq_len}")
                     # Send metadata only with the first chunk of each layer
-                    # to avoid redundant serialization (~6 KB × 84 chunks/layer)
                     include_meta = lidx not in meta_sent
                     msg = {
                         "request_id": request_id,
@@ -191,7 +190,11 @@ class ChunkedSender:
     def _downgrade_precision_map(
         precision_map: Dict, remaining_layers: List[int]
     ) -> Dict:
-        """Downgrade precision for remaining layers by one level."""
+        """Downgrade precision for remaining layers by one level.
+
+        Handles per-group tensors (shape [NUM_GROUPS]) by downgrading
+        each group's precision independently.
+        """
         DOWNGRADE = {
             Precision.FP16: Precision.FP8,
             Precision.FP8: Precision.INT4,
@@ -203,14 +206,20 @@ class ChunkedSender:
             new_map[dnode] = {}
             for lidx, prec_tensor in layer_map.items():
                 if lidx in remaining_layers:
-                    avg_prec = int(round(float(prec_tensor.float().mean())))
-                    cur = Precision(avg_prec) if avg_prec in {16, 8, 4, 2} else Precision.FP16
-                    downgraded = DOWNGRADE[cur]
-                    new_map[dnode][lidx] = torch.full(
-                        prec_tensor.shape, downgraded.value, dtype=torch.int8
-                    )
-                    if downgraded != cur:
-                        print(f"[sender]   layer {lidx}: {cur.name} → {downgraded.name}")
+                    # Downgrade each element (group) independently
+                    new_values = []
+                    for val in prec_tensor:
+                        cur = Precision(int(val.item())) if int(val.item()) in {16, 8, 4, 2} else Precision.FP16
+                        downgraded = DOWNGRADE[cur]
+                        new_values.append(downgraded.value)
+                    new_tensor = torch.tensor(new_values, dtype=torch.int8)
+                    new_map[dnode][lidx] = new_tensor
+                    # Log if any group was actually downgraded
+                    if any(DOWNGRADE[Precision(int(v.item()))] != Precision(int(v.item()))
+                           for v in prec_tensor if int(v.item()) in {16, 8, 4, 2}):
+                        avg_before = int(round(float(prec_tensor.float().mean())))
+                        avg_after = int(round(float(new_tensor.float().mean())))
+                        print(f"[sender]   layer {lidx}: avg {avg_before}b → {avg_after}b")
                 else:
                     new_map[dnode][lidx] = prec_tensor
         return new_map
