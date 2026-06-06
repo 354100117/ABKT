@@ -75,6 +75,7 @@ class PrecisionAllocator:
         kv_cache: Dict[int, Dict[int, Tuple[torch.Tensor, torch.Tensor]]],
         budget_bytes: float,
         num_layers_total: int = 0,
+        use_quality_fidelity: bool = True,
     ) -> AllocationResult:
         """Allocate precision levels under a byte budget (per-group granularity).
 
@@ -268,9 +269,11 @@ class PrecisionAllocator:
         prec_order = self._sorted_precisions  # [FP16, FP8, INT4, INT2]
         def _upgrade_benefit(entry):
             imp, dnode, lidx, gi, _ = entry
-            cur_prec = assignments[(dnode, lidx, gi)]
-            quality_gain = QUALITY_FIDELITY[Precision.FP16] - QUALITY_FIDELITY[cur_prec]
-            return imp * quality_gain
+            if use_quality_fidelity:
+                cur_prec = assignments[(dnode, lidx, gi)]
+                quality_gain = QUALITY_FIDELITY[Precision.FP16] - QUALITY_FIDELITY[cur_prec]
+                return imp * quality_gain
+            return imp
 
         sorted_entries = sorted(entries, key=_upgrade_benefit, reverse=True)
         for imp, dnode, lidx, gi, elem_cnt in sorted_entries:
@@ -450,3 +453,62 @@ class PrecisionAllocator:
                 total_bits += float(prec_tensor.float().mean()) * cnt
                 total_elements += cnt
         return total_bits / total_elements if total_elements > 0 else 0.0
+
+    @classmethod
+    def allocate_uniform(
+        cls,
+        kv_cache: Dict[int, Dict[int, Tuple[torch.Tensor, torch.Tensor]]],
+        precision: Precision,
+    ) -> AllocationResult:
+        """Allocate all layers at a uniform precision (baseline strategy)."""
+        prec_map = cls._uniform_map(kv_cache, precision)
+        total_fp16 = cls._total_bytes(kv_cache, Precision.FP16)
+        total_bytes = cls._total_bytes(kv_cache, precision)
+        meta = cls.metadata_bytes(kv_cache, precision)
+        actual = total_bytes + meta
+        return AllocationResult(
+            precision_map=prec_map,
+            total_bytes=actual,
+            budget_bytes=actual,
+            avg_precision_bits=float(precision.value),
+            compression_ratio=total_fp16 / max(actual, 1),
+        )
+
+    @classmethod
+    def allocate_random(
+        cls,
+        kv_cache: Dict[int, Dict[int, Tuple[torch.Tensor, torch.Tensor]]],
+        seed: int = 42,
+    ) -> AllocationResult:
+        """Allocate random precision per layer (baseline strategy)."""
+        gen = torch.Generator().manual_seed(seed)
+        all_precs = [Precision.FP16, Precision.FP8, Precision.INT4, Precision.INT2]
+        prec_map: Dict[int, Dict[int, torch.Tensor]] = {}
+        for dnode, layer_cache in kv_cache.items():
+            prec_map[dnode] = {}
+            for lidx, kv in layer_cache.items():
+                if kv is None:
+                    continue
+                idx = torch.randint(0, 4, (1,), generator=gen).item()
+                prec_map[dnode][lidx] = torch.full(
+                    (NUM_GROUPS,), all_precs[idx].value, dtype=torch.int8
+                )
+        total_fp16 = cls._total_bytes(kv_cache, Precision.FP16)
+        # Compute actual bytes using per-layer precision from prec_map
+        actual = 0.0
+        for dn, pm in prec_map.items():
+            for li, kv in kv_cache.get(dn, {}).items():
+                if kv is None:
+                    continue
+                prec_val = int(pm[li].float().mean().item())
+                prec = Precision(prec_val)
+                actual += cls._total_bytes({dn: {li: kv}}, prec)
+                actual += cls.metadata_bytes({dn: {li: kv}}, prec)
+        avg_bits = cls._avg_precision(prec_map)
+        return AllocationResult(
+            precision_map=prec_map,
+            total_bytes=actual,
+            budget_bytes=actual,
+            avg_precision_bits=avg_bits,
+            compression_ratio=total_fp16 / max(actual, 1),
+        )
