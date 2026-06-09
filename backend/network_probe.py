@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import struct
 import threading
 import time
@@ -32,6 +33,8 @@ from backend.config import (
     COLD_BW, BW_WINDOW_SIZE, TRANSFER_BW_ALPHA, DIVERGENCE_THRESHOLD,
     COLD_START_MARGIN, MIN_SAFETY_MARGIN, CONFIDENCE_TRANSFERS,
     TARGET_TRANSFER_TIME, PROBE_CONNECT_TIMEOUT, PROBE_RTT_TIMEOUT,
+    CONFIDENCE_DECAY_SEC, CONFIDENCE_DECAY_HALF_LIFE,
+    CONFIDENCE_PROBE_RATIO, BW_PERCENTILE_INDEX,
 )
 from backend.ewma import EWMA
 from backend.state_machine import NetworkState, NetworkStateMachine
@@ -177,6 +180,8 @@ class NetworkProbeClient:
         self._calibrated = False
         self._bw_probe_counter = 0
         self._transfer_count = 0
+        self._probe_count = 0          # B3: successful probe count
+        self._last_transfer_time = 0.0  # B4: timestamp of last transfer
 
         # Bandwidth probe pause (paused during KV cache transfer)
         self._bw_probes_paused = False
@@ -196,14 +201,20 @@ class NetworkProbeClient:
     # ── Public API ──
 
     def get_effective_bw(self) -> float:
-        """Conservative bandwidth estimate using sliding window minimum.
+        """Conservative bandwidth estimate using sliding window percentile.
 
-        Uses the minimum of the sliding window (recent probes + transfers)
-        with a confidence-scaled safety margin. The window minimum responds
-        immediately to bandwidth drops while being naturally conservative
-        on recovery — exactly the behavior we want for budget planning.
+        Uses the 10th percentile of the sliding window (recent probes + transfers)
+        with a confidence-scaled safety margin. Percentile-based estimation
+        recovers faster from bandwidth drops than absolute minimum while
+        still protecting against outliers.
         """
-        window_bw = min(self._bw_window) if self._bw_window else None
+        # B5: Use percentile instead of min for faster recovery
+        if self._bw_window:
+            sorted_bw = sorted(self._bw_window)
+            idx = min(BW_PERCENTILE_INDEX, len(sorted_bw) - 1)
+            window_bw = sorted_bw[idx]
+        else:
+            window_bw = None
         transfer_bw = self._bw_transfer_ewma.value
 
         # Cold start: no data yet
@@ -214,7 +225,7 @@ class NetworkProbeClient:
         if transfer_bw is None:
             return (window_bw or COLD_BW) * COLD_START_MARGIN
 
-        # Post-calibration: use window min as primary, cross-check with transfer
+        # Post-calibration: use window percentile as primary, cross-check with transfer
         if window_bw is not None:
             ratio = window_bw / max(transfer_bw, 1.0)
             if ratio > DIVERGENCE_THRESHOLD:
@@ -225,8 +236,18 @@ class NetworkProbeClient:
         else:
             base = transfer_bw
 
-        # Confidence-scaled safety margin: more data → less margin
-        confidence = min(self._transfer_count / CONFIDENCE_TRANSFERS, 1.0)
+        # B3: Probe-based confidence ramp (probes contribute at 1/3 rate)
+        transfer_conf = min(self._transfer_count / CONFIDENCE_TRANSFERS, 1.0)
+        probe_conf = min(self._probe_count / (CONFIDENCE_TRANSFERS * CONFIDENCE_PROBE_RATIO), 1.0)
+        confidence = max(transfer_conf, probe_conf)
+
+        # B4: Decay confidence after prolonged inactivity
+        if self._last_transfer_time > 0:
+            elapsed = time.time() - self._last_transfer_time
+            if elapsed > CONFIDENCE_DECAY_SEC:
+                decay = max(0.0, 1.0 - (elapsed - CONFIDENCE_DECAY_SEC) / CONFIDENCE_DECAY_HALF_LIFE)
+                confidence *= decay
+
         margin = COLD_START_MARGIN + confidence * (MIN_SAFETY_MARGIN - COLD_START_MARGIN)
         return base * margin
 
@@ -283,6 +304,7 @@ class NetworkProbeClient:
             self._bw_window.append(measured_bw)
             self._bw_transfer_ewma.update_clamped(measured_bw, max_change=EWMA_MAX_CHANGE)
             self._transfer_count += 1
+            self._last_transfer_time = time.time()  # B4: track for decay
             self._calibrated = True
 
     def warmup_connection(self) -> None:
@@ -295,7 +317,7 @@ class NetworkProbeClient:
             sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
             sock.settimeout(PROBE_CONNECT_TIMEOUT)
             sock.connect((self.target_host, self.target_port))
-            data = b'\x00' * WARMUP_BYTES
+            data = os.urandom(WARMUP_BYTES)
             sock.sendall(bytes([PROBE_BW]) + struct.pack("!I", WARMUP_BYTES) + data)
             sock.recv(1)
             sock.close()
@@ -371,7 +393,7 @@ class NetworkProbeClient:
             sock.settimeout(PROBE_CONNECT_TIMEOUT)
             sock.connect((self.target_host, self.target_port))
 
-            data = b'\x00' * data_size
+            data = os.urandom(data_size)
             t0 = time.time()
             sock.sendall(bytes([PROBE_BW]) + struct.pack("!I", data_size) + data)
             sock.recv(1)
@@ -381,6 +403,7 @@ class NetworkProbeClient:
                 bw_bps = data_size / elapsed
                 with self._lock:
                     self._bw_window.append(bw_bps)
+                    self._probe_count += 1  # B3: count successful probes
                     self._state_machine.update(
                         self._get_bw_for_state_machine(),
                         self._rtt_ewma.value or 0.0,

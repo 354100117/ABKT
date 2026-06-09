@@ -193,8 +193,8 @@ class ChunkedSender:
         each group's precision independently.
         """
         DOWNGRADE = {
-            Precision.FP16: Precision.FP8,
-            Precision.FP8: Precision.INT4,
+            Precision.FP16: Precision.INT8,
+            Precision.INT8: Precision.INT4,
             Precision.INT4: Precision.INT2,
             Precision.INT2: Precision.INT2,
         }

@@ -1,0 +1,72 @@
+# ABKT Backend Configuration
+# All values shown are the defaults. Override any key to customize.
+# Usage: python prefill_node.py --config tools/default_config.yaml
+
+# ── Network probing & bandwidth estimation ──
+
+rtt_interval_sec: 1.0       # RTT probe interval (seconds)
+bw_alpha: 0.3               # bandwidth EWMA smoothing (probe data)
+rtt_alpha: 0.5              # RTT EWMA smoothing
+ewma_max_change: 0.20       # EWMA update clamp: ±20% per step
+warmup_bytes: 102400        # 100 KB TCP warmup payload
+min_calib_bytes: 1048576    # 1 MB — skip calibration for smaller transfers
+min_calib_elapsed: 0.100    # 100ms — skip calibration if too fast
+cold_bw: 15000000.0         # 15 MB/s cold-start bandwidth estimate
+
+# Sliding window + transfer EWMA
+bw_window_size: 10          # sliding window size for bandwidth samples
+transfer_bw_alpha: 0.5      # transfer EWMA alpha
+divergence_threshold: 2.5   # probe/transfer ratio to flag mismatch
+cold_start_margin: 0.7      # 70% of estimate when uncalibrated
+min_safety_margin: 0.8      # floor: never use >80% of estimated bw
+confidence_transfers: 5     # full confidence after this many transfers
+target_transfer_time: 2.0   # target transfer time in seconds
+
+# Confidence time decay
+confidence_decay_sec: 120.0       # start decaying after 2 min of no transfers
+confidence_decay_half_life: 300.0 # half confidence every 5 min
+
+# Probe-based confidence ramp
+confidence_probe_ratio: 3   # probes contribute at 1/3 the rate of transfers
+
+# Bandwidth recovery
+bw_percentile_index: 0      # 10th percentile index (0-based)
+
+# Socket timeouts
+probe_connect_timeout: 5.0
+probe_rtt_timeout: 10.0
+
+# Budget
+int4_headroom: 1.3          # 30% above INT4 for importance-based upgrades
+max_transfer_time: 60.0     # safety cap in seconds
+
+# ── Network state machine (hysteresis) ──
+
+bw_good_threshold: 40000000.0    # 40 MB/s → GOOD
+bw_poor_threshold: 15000000.0    # 15 MB/s → POOR
+rtt_good_threshold: 10.0         # 10 ms → GOOD
+rtt_degraded_threshold: 20.0     # 20 ms → DEGRADED
+
+# Voting windows
+downgrade_votes: 2          # 2 of last 3 to downgrade
+downgrade_window: 3
+upgrade_votes: 4            # 4 of last 5 to upgrade
+upgrade_window: 5
+
+# ── Precision allocation ──
+
+num_groups: 4               # token groups per layer
+
+# ── Chunked transfer ──
+
+min_chunk_size: 16
+max_chunk_size: 256
+timing_check_interval: 2    # check throughput every N chunks
+slow_threshold: 0.7         # actual_bw < expected * threshold → downgrade
+
+# ── Token importance (3D scoring weights) ──
+
+importance_alpha: 0.6       # attention importance weight
+importance_beta: 0.25       # layer sensitivity weight
+importance_gamma: 0.15      # position decay weight
+position_decay_rate: 0.01   # exponential decay rate

@@ -714,8 +714,15 @@ def _parse_prefill_config() -> PDConfig:
                         help="Interactive multi-turn chat mode")
     parser.add_argument("--system-prompt", default=None,
                         help="System prompt for interactive mode")
+    parser.add_argument("--config", default=None,
+                        help="YAML/JSON config file to override backend tuning parameters")
 
     args = parser.parse_args()
+
+    # Load config overrides before anything else
+    if args.config:
+        from backend.config import load_config
+        load_config(args.config)
 
     layer_split = None
     if args.layer_split and args.layer_split.lower() not in ("", "none", "all"):

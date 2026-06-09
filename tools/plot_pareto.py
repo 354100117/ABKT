@@ -46,7 +46,7 @@ def plot_pareto(results: List[dict], output: str, title: str = None):
     colors = {
         "fp16": "#2ecc71",
         "abkt": "#e74c3c",
-        "uniform_fp8": "#3498db",
+        "uniform_int8": "#3498db",
         "uniform_int4": "#9b59b6",
         "uniform_int2": "#e67e22",
         "random": "#95a5a6",

@@ -1,6 +1,6 @@
 """Adaptive quantization/dequantization for mixed-precision KV Cache.
 
-Supports FP16 (passthrough), FP8 (symmetric int8), INT4 (asymmetric uint4),
+Supports FP16 (passthrough), INT8 (symmetric int8), INT4 (asymmetric uint4),
 and INT2 (asymmetric uint2) with per-group precision within each layer.
 
 The precision_map from PrecisionAllocator determines which precision each
@@ -127,7 +127,7 @@ class AdaptiveQuantizer:
         """Dequantize a per-group quantized layer.
 
         Data is stored as uint8. FP16 groups need view(float16) to recover
-        the original float16 bytes. FP8 groups need view(int8) before
+        the original float16 bytes. INT8 groups need view(int8) before
         dequantization. INT4/INT2 groups are already uint8.
         """
         k, v = kv
@@ -150,7 +150,7 @@ class AdaptiveQuantizer:
                 v_parts.append(v_slice.view(torch.float16))
             elif prec_val == 8:
                 # Reinterpret uint8 back to int8, then dequantize
-                p = Precision.FP8
+                p = Precision.INT8
                 dk = AdaptiveQuantizer._dequantize(
                     k_slice.view(torch.int8),
                     gm.get("scale_k"), gm.get("zero_k"), p)
@@ -170,7 +170,7 @@ class AdaptiveQuantizer:
 
         return torch.cat(k_parts, dim=2), torch.cat(v_parts, dim=2)
 
-    # ── Single-precision quantization (legacy / FP8) ──
+    # ── Single-precision quantization (legacy / INT8) ──
 
     @staticmethod
     def _quantize_single(
@@ -179,7 +179,7 @@ class AdaptiveQuantizer:
         """Quantize entire layer with a single precision."""
         if prec == Precision.FP16:
             return k, v, {"precision": 16}
-        elif prec == Precision.FP8:
+        elif prec == Precision.INT8:
             qk, mk = AdaptiveQuantizer._quantize(k, prec)
             qv, mv = AdaptiveQuantizer._quantize(v, prec)
             return qk, qv, {
@@ -200,9 +200,9 @@ class AdaptiveQuantizer:
 
     @staticmethod
     def _quantize(tensor: torch.Tensor, precision: Precision) -> Tuple[torch.Tensor, dict]:
-        """Per-layer quantization (one scale/zero per tensor). Used for FP8."""
+        """Per-layer quantization (one scale/zero per tensor). Used for INT8."""
         f = tensor.float()
-        if precision == Precision.FP8:
+        if precision == Precision.INT8:
             scale = f.abs().max() / 127.0
             if scale < 1e-10:
                 scale = 1.0

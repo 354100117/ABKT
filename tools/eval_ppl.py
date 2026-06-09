@@ -20,7 +20,7 @@ Usage:
     python tools/eval_ppl.py --model /ssd/models/opt-2.7b-safetensors --output results.json
 
     # Run specific strategies
-    python tools/eval_ppl.py --model /ssd/models/opt-2.7b-safetensors --strategy abkt uniform_fp8
+    python tools/eval_ppl.py --model /ssd/models/opt-2.7b-safetensors --strategy abkt uniform_int8
 
     # Ablation experiment
     python tools/eval_ppl.py --model /ssd/models/opt-2.7b-safetensors \\
@@ -52,7 +52,7 @@ from pd_inference.kv_cache import KVCache
 # ── Strategy definitions ──
 
 ALL_STRATEGIES = [
-    "fp16", "abkt", "uniform_fp8", "uniform_int4", "uniform_int2", "random",
+    "fp16", "abkt", "uniform_int8", "uniform_int4", "uniform_int2", "random",
 ]
 
 ABLATION_STRATEGIES = [
@@ -122,8 +122,8 @@ def evaluate_strategy(
         # c) Apply strategy to get precision_map
         if strategy == "fp16":
             result = allocator.allocate_uniform(abkt_kv, Precision.FP16)
-        elif strategy == "uniform_fp8":
-            result = allocator.allocate_uniform(abkt_kv, Precision.FP8)
+        elif strategy == "uniform_int8":
+            result = allocator.allocate_uniform(abkt_kv, Precision.INT8)
         elif strategy == "uniform_int4":
             result = allocator.allocate_uniform(abkt_kv, Precision.INT4)
         elif strategy == "uniform_int2":
@@ -206,6 +206,7 @@ def evaluate_strategy(
         "num_windows": len(windows),
         "total_tokens": total_tokens,
         "elapsed_sec": elapsed,
+        "context_len": context_len,
     }
 
 
@@ -246,10 +247,18 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default=None, help="Save results as JSON")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--long-seq", action="store_true", default=False,
+                        help="Run multiple context lengths (2048, 4096, 8192)")
     args = parser.parse_args()
 
     if args.strategy is None:
         args.strategy = ALL_STRATEGIES
+
+    # Determine context lengths to test
+    if args.long_seq:
+        context_lengths = [2048, 4096, 8192]
+    else:
+        context_lengths = [args.context_len]
 
     print(f"Loading model: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -265,39 +274,55 @@ def main():
     all_ids = tokenizer.encode(all_text)
     print(f"Dataset: {len(all_ids)} tokens")
 
-    # Build sliding windows
-    windows = []
-    for i in range(0, len(all_ids) - args.context_len + 1, args.stride):
-        windows.append(all_ids[i:i + args.context_len])
-    if args.max_windows:
-        windows = windows[:args.max_windows]
-    print(f"Windows: {len(windows)} (context={args.context_len}, stride={args.stride})")
+    all_results = []
 
-    # Run each strategy
-    results = []
-    for strategy in args.strategy:
-        print(f"\nEvaluating: {strategy}")
-        r = evaluate_strategy(
-            model, windows, strategy,
-            context_len=args.context_len,
-            stride=args.stride,
-            budget_ratio=args.budget_ratio,
-            seed=args.seed,
-            device=args.device,
-        )
-        results.append(r)
-        print(f"  DONE: PPL={r['ppl']:.4f}, avg_bits={r['avg_bits']:.1f}, "
-              f"compression={r['compression_ratio']:.2f}x, {r['elapsed_sec']:.1f}s")
+    for ctx_len in context_lengths:
+        stride = min(args.stride, ctx_len // 4) or 512
+
+        # Build sliding windows
+        windows = []
+        for i in range(0, len(all_ids) - ctx_len + 1, stride):
+            windows.append(all_ids[i:i + ctx_len])
+        if args.max_windows:
+            windows = windows[:args.max_windows]
+
+        if not windows:
+            print(f"\nSkipping context_len={ctx_len}: not enough tokens")
+            continue
+
+        print(f"\n{'=' * 60}")
+        print(f"  Context length: {ctx_len}, Stride: {stride}, Windows: {len(windows)}")
+        print(f"{'=' * 60}")
+
+        for strategy in args.strategy:
+            print(f"\nEvaluating: {strategy} (ctx={ctx_len})")
+            try:
+                r = evaluate_strategy(
+                    model, windows, strategy,
+                    context_len=ctx_len,
+                    stride=stride,
+                    budget_ratio=args.budget_ratio,
+                    seed=args.seed,
+                    device=args.device,
+                )
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                print(f"  OOM at context_len={ctx_len}, strategy={strategy} — skipping")
+                continue
+            all_results.append(r)
+            print(f"  DONE: PPL={r['ppl']:.4f}, avg_bits={r['avg_bits']:.1f}, "
+                  f"compression={r['compression_ratio']:.2f}x, {r['elapsed_sec']:.1f}s")
 
     # Print table
     model_name = os.path.basename(args.model.rstrip("/"))
-    print_comparison_table(results, model_name, args.dataset_config,
-                           args.context_len, args.stride)
+    if all_results:
+        print_comparison_table(all_results, model_name, args.dataset_config,
+                               context_lengths[-1], args.stride)
 
     # Save JSON
     if args.output:
         with open(args.output, "w") as f:
-            json.dump(results, f, indent=2)
+            json.dump(all_results, f, indent=2)
         print(f"Results saved to {args.output}")
 
 

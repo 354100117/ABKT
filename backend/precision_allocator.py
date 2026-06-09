@@ -1,15 +1,22 @@
 """Precision allocator — PIA (Proportional-Importance Allocation) algorithm.
 
 Given a budget of bytes and an importance score for each (layer, token) entry,
-allocate precision levels (FP16/FP8/INT4/INT2) greedily to maximize weighted quality.
+allocate precision levels (FP16/INT8/INT4/INT2) greedily to maximize weighted quality.
 
 Algorithm:
   1. Start all entries at the minimum precision that fits within budget.
   2. Sort entries by importance descending.
   3. For each entry, try upgrading from current precision to the next higher level
      if the budget allows.
-  4. This is guaranteed to be optimal for the budget-constrained problem with
-     uniform quality-per-byte across entries (proved by the greedy exchange argument).
+
+Approximation: This is a greedy heuristic for the Multiple-Choice Knapsack Problem
+(MCKP). It achieves a 1/2-approximation in the worst case (Kellerer et al., 2004).
+In practice, the approximation is much tighter due to the narrow range of quality
+fidelity values (0.80–1.00).
+
+Limitation: The additive quality model (SUM I_i * Q(p_i)) assumes each entry's
+quality contribution is independent. Inter-layer error propagation is not modeled.
+See tools/calibrate_fidelity.py for empirical validation.
 """
 
 from __future__ import annotations
@@ -63,7 +70,7 @@ class PrecisionAllocator:
 
     def __init__(self, precision_levels: Optional[List[Precision]] = None):
         self.precision_levels = precision_levels or [
-            Precision.FP16, Precision.FP8, Precision.INT4, Precision.INT2,
+            Precision.FP16, Precision.INT8, Precision.INT4, Precision.INT2,
         ]
         self._sorted_precisions = sorted(
             self.precision_levels, key=lambda p: p.value, reverse=True
@@ -87,7 +94,7 @@ class PrecisionAllocator:
             kv_cache: {decode_node: {layer: (k, v)}} — used for shape info and total size.
             budget_bytes: Maximum bytes allowed for the transfer.
             num_layers_total: Total layers in model. When > 0, enables per-layer
-                minimum precision constraints (bottom 1/3: FP8, middle: INT4, top: INT2).
+                minimum precision constraints (bottom 1/3: INT8, middle: INT4, top: INT2).
 
         Returns:
             AllocationResult with precision_map as {dnode: {lidx: tensor[NUM_GROUPS]}}.
@@ -266,7 +273,7 @@ class PrecisionAllocator:
             current_bytes += BYTES_PER_ELEMENT[prec] * elem_cnt
 
         # Greedy upgrade by importance × quality gain (per-group)
-        prec_order = self._sorted_precisions  # [FP16, FP8, INT4, INT2]
+        prec_order = self._sorted_precisions  # [FP16, INT8, INT4, INT2]
         def _upgrade_benefit(entry):
             imp, dnode, lidx, gi, _ = entry
             if use_quality_fidelity:
@@ -319,7 +326,7 @@ class PrecisionAllocator:
                     continue
                 prec_tensor = torch.tensor([
                     assignments.get((dnode, lidx, gi),
-                                    entry_min_prec.get((dnode, lidx), Precision.FP8)).value
+                                    entry_min_prec.get((dnode, lidx), Precision.INT8)).value
                     for gi in range(NUM_GROUPS)
                 ], dtype=torch.int8)
                 precision_map[dnode][lidx] = prec_tensor
@@ -368,12 +375,12 @@ class PrecisionAllocator:
           Per group: (head_dim + group_seq_len) × 4 bytes.
           Total per layer: NUM_GROUPS × (head_dim + seq_len/NUM_GROUPS) × 4 bytes.
 
-        For FP8: scalar scale/zero → ~8 bytes per layer (negligible).
+        For INT8: scalar scale/zero → ~8 bytes per layer (negligible).
         For FP16: 0 bytes.
         """
         if precision in (Precision.FP16,):
             return 0.0
-        if precision == Precision.FP8:
+        if precision == Precision.INT8:
             count = sum(1 for lc in kv_cache.values()
                         for kv in lc.values() if kv is not None)
             return count * 8.0
@@ -399,34 +406,48 @@ class PrecisionAllocator:
     ) -> Precision:
         """Per-layer minimum precision constraint.
 
-        Bottom 1/3 layers: min FP8 (feature extraction, sensitive to quantization error)
-        Middle 1/3 layers: min INT4
-        Top 1/3 layers: min INT2 (high-level semantics, more robust)
+        Bottom layers: min INT8 (feature extraction, sensitive to quantization error)
+        Middle layers: min INT4
+        Top layers: min INT2 (high-level semantics, more robust)
+
+        The boundaries shift based on compression_ratio:
+          < 4.0: default 1/3 split
+          4.0-8.0: tighter — bottom 1/4 INT8, middle INT4, top INT2
+          > 8.0: aggressive — bottom 1/6 INT8, rest INT4/INT2
 
         Args:
             layer_idx: Index of the layer being evaluated.
             num_layers_total: Total number of layers in the model. When 0, returns
-                FP8 for backward compatibility.
+                INT8 for backward compatibility.
             compression_ratio: FP16_size / budget. Higher values mean more compression
-                needed. Currently unused but reserved for future tightening logic.
+                needed.
 
         Returns:
             Minimum Precision allowed for this layer.
         """
-        # Backward compat: no layer info → global FP8 floor (old behavior)
+        # Backward compat: no layer info → global INT8 floor (old behavior)
         if num_layers_total <= 0:
-            return Precision.FP8
+            return Precision.INT8
 
-        # Determine which third this layer falls into
-        third = num_layers_total / 3.0
-        if layer_idx < third:
-            # Bottom 1/3: feature extraction, most sensitive
-            return Precision.FP8
-        elif layer_idx < 2 * third:
-            # Middle 1/3: intermediate representations
+        # Determine boundary fractions based on compression demand
+        if compression_ratio > 8.0:
+            # Aggressive: bottom 1/6 INT8, middle INT4, top INT2
+            frac_int8 = 1.0 / 6.0
+            frac_int4 = 3.0 / 6.0  # middle 2/6
+        elif compression_ratio > 4.0:
+            # Tighter: bottom 1/4 INT8, middle INT4, top INT2
+            frac_int8 = 0.25
+            frac_int4 = 0.50
+        else:
+            # Default: bottom 1/3 INT8, middle INT4, top INT2
+            frac_int8 = 1.0 / 3.0
+            frac_int4 = 2.0 / 3.0
+
+        if layer_idx < num_layers_total * frac_int8:
+            return Precision.INT8
+        elif layer_idx < num_layers_total * frac_int4:
             return Precision.INT4
         else:
-            # Top 1/3: high-level semantics, most robust
             return Precision.INT2
 
     @staticmethod
@@ -482,7 +503,7 @@ class PrecisionAllocator:
     ) -> AllocationResult:
         """Allocate random precision per layer (baseline strategy)."""
         gen = torch.Generator().manual_seed(seed)
-        all_precs = [Precision.FP16, Precision.FP8, Precision.INT4, Precision.INT2]
+        all_precs = [Precision.FP16, Precision.INT8, Precision.INT4, Precision.INT2]
         prec_map: Dict[int, Dict[int, torch.Tensor]] = {}
         for dnode, layer_cache in kv_cache.items():
             prec_map[dnode] = {}

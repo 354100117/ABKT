@@ -204,18 +204,18 @@ def test_pia_ample_budget():
 
 
 def test_pia_zero_budget():
-    """With zero budget, everything should be at minimum precision (FP8)."""
+    """With zero budget, everything should be at minimum precision (INT8)."""
     kv = _make_kv_cache(num_layers=2, seq=64)
     budget = 0.0
     imp = {0: {i: torch.ones(64) for i in range(2)}}
     alloc = PrecisionAllocator()
     result = alloc.allocate(imp, kv, budget)
 
-    # Minimum precision is FP8 (1 byte/element)
+    # Minimum precision is INT8 (1 byte/element)
     fp16_total = PrecisionAllocator._total_bytes(kv, Precision.FP16)
-    fp8_total = fp16_total / 2  # FP8 = 1 byte vs FP16 = 2 bytes
-    assert result.total_bytes <= fp8_total * 1.01, (
-        f"Should be near FP8 total ({fp8_total:.0f}), "
+    int8_total = fp16_total / 2  # INT8 = 1 byte vs FP16 = 2 bytes
+    assert result.total_bytes <= int8_total * 1.01, (
+        f"Should be near INT8 total ({int8_total:.0f}), "
         f"got {result.total_bytes:.0f}")
     assert result.compression_ratio >= 1.9, "Should achieve ~2x compression"
 
@@ -241,16 +241,16 @@ def test_pia_importance_respected():
 
 
 def test_pia_budget_constraint():
-    """Allocation should respect budget (or clamp to FP8 floor)."""
+    """Allocation should respect budget (or clamp to INT8 floor)."""
     kv = _make_kv_cache(num_layers=4, seq=128)
     total_fp16 = PrecisionAllocator._total_bytes(kv, Precision.FP16)
-    budget = total_fp16 * 0.6  # 60% — enough for FP8 mix
+    budget = total_fp16 * 0.6  # 60% — enough for INT8 mix
     imp = {0: {i: torch.ones(128) * (1.0 - i * 0.2) for i in range(4)}}
     alloc = PrecisionAllocator()
     result = alloc.allocate(imp, kv, budget)
 
-    fp8_floor = total_fp16 * 0.5  # FP8 minimum
-    effective_limit = max(budget, fp8_floor)
+    int8_floor = total_fp16 * 0.5  # INT8 minimum
+    effective_limit = max(budget, int8_floor)
     assert result.total_bytes <= effective_limit * 1.01, (
         f"Allocation ({result.total_bytes:.0f}) exceeds limit ({effective_limit:.0f})")
 
@@ -273,8 +273,8 @@ def test_quant_fp16_roundtrip():
     assert (v0 == dv).all(), "FP16 should be lossless for values"
 
 
-def test_quant_fp8_roundtrip():
-    """FP8 quantization should produce reasonable error (<5%)."""
+def test_quant_int8_roundtrip():
+    """INT8 quantization should produce reasonable error (<5%)."""
     kv = _make_kv_cache(num_layers=1, seq=16)
     prec_map = {0: {0: torch.full((16,), 8, dtype=torch.int8)}}
     q = AdaptiveQuantizer()
@@ -284,7 +284,7 @@ def test_quant_fp8_roundtrip():
     orig = kv[0][0][0].float()
     deq = dequantized[0][0][0].float()
     mse = ((orig - deq) ** 2).mean().sqrt() / orig.std()
-    assert mse < 0.05, f"FP8 relative error should be <5%, got {mse:.4f}"
+    assert mse < 0.05, f"INT8 relative error should be <5%, got {mse:.4f}"
 
 
 def test_quant_int4_roundtrip():
@@ -437,7 +437,7 @@ def test_downgrade_precision_map():
     prec_map = {
         0: {
             0: torch.full((8,), 16, dtype=torch.int8),   # FP16
-            1: torch.full((8,), 8, dtype=torch.int8),    # FP8
+            1: torch.full((8,), 8, dtype=torch.int8),    # INT8
             2: torch.full((8,), 4, dtype=torch.int8),    # INT4
             3: torch.full((8,), 2, dtype=torch.int8),    # INT2
         }
@@ -445,8 +445,8 @@ def test_downgrade_precision_map():
     remaining = [0, 1, 2, 3]
     new_map = ChunkedSender._downgrade_precision_map(prec_map, remaining)
 
-    assert (new_map[0][0] == 8).all(), "FP16 should downgrade to FP8"
-    assert (new_map[0][1] == 4).all(), "FP8 should downgrade to INT4"
+    assert (new_map[0][0] == 8).all(), "FP16 should downgrade to INT8"
+    assert (new_map[0][1] == 4).all(), "INT8 should downgrade to INT4"
     assert (new_map[0][2] == 2).all(), "INT4 should downgrade to INT2"
     assert (new_map[0][3] == 2).all(), "INT2 should stay INT2"
 
@@ -488,7 +488,7 @@ if __name__ == "__main__":
         ("PIA importance respected", test_pia_importance_respected),
         ("PIA budget constraint", test_pia_budget_constraint),
         ("Quant FP16 roundtrip", test_quant_fp16_roundtrip),
-        ("Quant FP8 roundtrip", test_quant_fp8_roundtrip),
+        ("Quant INT8 roundtrip", test_quant_int8_roundtrip),
         ("Quant INT4 roundtrip", test_quant_int4_roundtrip),
         ("Quant mixed precision", test_mixed_precision),
         ("Calibration uncompressed-equivalent", test_calibration_uncompressed_equivalent),
