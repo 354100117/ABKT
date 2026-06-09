@@ -2,7 +2,10 @@
 # Usage: python tools/run_multi_model.py --config tools/models.yaml --max-windows 5
 
 models:
-  - name: opt-2.7b
-    path: /ssd/models/opt-2.7b-safetensors
   - name: qwen2.5-3b
     path: /ssd/models/qwen2.5-3b
+  # 下载后取消注释:
+  # - name: qwen2.5-7b
+  #   path: /ssd/models/qwen2.5-7b
+  # - name: qwen2.5-1.5b
+  #   path: /ssd/models/qwen2.5-1.5b
