@@ -1,0 +1,14 @@
+[
+  {
+    "strategy": "abkt",
+    "ppl": 10.288880871812053,
+    "avg_bits": 6.388888888888889,
+    "compression_ratio": 2.478085506856682,
+    "total_bytes": 7616512.0,
+    "fp16_bytes": 18874368.0,
+    "num_windows": 10,
+    "total_tokens": 15350,
+    "elapsed_sec": 15.614105224609375,
+    "context_len": 2048
+  }
+]
