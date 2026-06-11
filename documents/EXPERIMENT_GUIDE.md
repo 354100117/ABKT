@@ -277,15 +277,18 @@ sudo python3 net_tools/test_orchestrator.py \
 | random | | | | | |
 | uniform_int2 | | | | | |
 
-### Exp 2: 消融实验 (Qwen2.5-3B)
+### Exp 2: 消融实验 (Qwen2.5-3B, budget_ratio=0.5)
 
 | 策略 | PPL | Delta vs Full | 压缩比 |
 |------|-----|--------------|--------|
-| abkt_full | | 0 | |
-| abkt_no_attn | | | |
-| abkt_no_layer | | | |
-| abkt_no_position | | | |
-| abkt_no_fidelity | | | |
+| abkt_full | 8.3238 | 0 | 1.99x |
+| abkt_no_attn | 7.7620 | -0.5618 | 1.99x |
+| abkt_no_layer | 8.3286 | +0.0048 | 1.99x |
+| abkt_no_position | 8.2748 | -0.0490 | 1.99x |
+| abkt_no_fidelity | 8.8186 | +0.4948 | 1.98x |
+
+注：budget_ratio=0.5 时预算充足（all-INT8），importance 评分无发挥空间。
+需在低预算（0.3-0.4）下重新验证。
 
 ### Exp 3: Budget Sweep (Qwen2.5-3B)
 

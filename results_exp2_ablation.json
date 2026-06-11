@@ -1,0 +1,62 @@
+[
+  {
+    "strategy": "abkt_full",
+    "ppl": 8.323801888726042,
+    "avg_bits": 8.0,
+    "compression_ratio": 1.9866350506574693,
+    "total_bytes": 9500672.0,
+    "fp16_bytes": 18874368.0,
+    "num_windows": 580,
+    "total_tokens": 890300,
+    "elapsed_sec": 882.0839505195618,
+    "context_len": 2048
+  },
+  {
+    "strategy": "abkt_no_attn",
+    "ppl": 7.7619661101139465,
+    "avg_bits": 8.0,
+    "compression_ratio": 1.9866350506574693,
+    "total_bytes": 9500672.0,
+    "fp16_bytes": 18874368.0,
+    "num_windows": 580,
+    "total_tokens": 890300,
+    "elapsed_sec": 877.4726932048798,
+    "context_len": 2048
+  },
+  {
+    "strategy": "abkt_no_layer",
+    "ppl": 8.328609427032854,
+    "avg_bits": 8.0,
+    "compression_ratio": 1.9866350506574693,
+    "total_bytes": 9500672.0,
+    "fp16_bytes": 18874368.0,
+    "num_windows": 580,
+    "total_tokens": 890300,
+    "elapsed_sec": 881.2854936122894,
+    "context_len": 2048
+  },
+  {
+    "strategy": "abkt_no_position",
+    "ppl": 8.274816395591342,
+    "avg_bits": 8.0,
+    "compression_ratio": 1.9866350506574693,
+    "total_bytes": 9500672.0,
+    "fp16_bytes": 18874368.0,
+    "num_windows": 580,
+    "total_tokens": 890300,
+    "elapsed_sec": 874.1163606643677,
+    "context_len": 2048
+  },
+  {
+    "strategy": "abkt_no_fidelity",
+    "ppl": 8.818589294232837,
+    "avg_bits": 8.0,
+    "compression_ratio": 1.9847525520093037,
+    "total_bytes": 9509683.2,
+    "fp16_bytes": 18874368.0,
+    "num_windows": 580,
+    "total_tokens": 890300,
+    "elapsed_sec": 870.6546640396118,
+    "context_len": 2048
+  }
+]
