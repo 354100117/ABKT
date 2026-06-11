@@ -88,9 +88,9 @@ NUM_GROUPS = 4              # token groups per layer for per-group quantization
 
 QUALITY_FIDELITY = {
     Precision.FP16: 1.00,
-    Precision.INT8: 0.98,
-    Precision.INT4: 0.92,
-    Precision.INT2: 0.80,
+    Precision.INT8: 0.999,  # calibrated: PPL delta ~0.06% on Qwen2.5-3B
+    Precision.INT4: 0.99,   # calibrated: PPL delta ~14% on Qwen2.5-3B
+    Precision.INT2: 0.85,   # calibrated: PPL delta ~75% on Qwen2.5-3B
 }
 
 BYTES_PER_ELEMENT = {

@@ -133,6 +133,9 @@ class PrecisionAllocator:
 
         entries.sort(key=lambda x: x[0], reverse=True)
 
+        # Compute compression ratio (needed for floor calculation)
+        compression_needed = total_fp16 / max(budget_bytes, 1)
+
         # Compute minimum floor (per-group, using layer-level min precision)
         min_floor = 0.0
         for dnode, layer_cache in kv_cache.items():
@@ -143,7 +146,7 @@ class PrecisionAllocator:
                 seq_len = k.shape[2]
                 k_per_token = k.numel() // seq_len
                 v_per_token = v.numel() // seq_len
-                min_prec = self._min_precision_for_layer(lidx, num_layers_total, 999)
+                min_prec = self._min_precision_for_layer(lidx, num_layers_total, compression_needed)
                 for gi in range(NUM_GROUPS):
                     g_start = gi * seq_len // NUM_GROUPS
                     g_end = (gi + 1) * seq_len // NUM_GROUPS
@@ -253,8 +256,6 @@ class PrecisionAllocator:
                     forced_int2=True,
                     dropped_layers=dropped,
                 )
-
-        compression_needed = total_fp16 / max(budget_bytes, 1)
 
         # Per-group minimum precision (uses layer-level constraint)
         entry_min_prec: Dict[Tuple[int, int], Precision] = {}
@@ -406,9 +407,9 @@ class PrecisionAllocator:
     ) -> Precision:
         """Per-layer minimum precision constraint.
 
-        Bottom layers: min INT8 (feature extraction, sensitive to quantization error)
-        Middle layers: min INT4
-        Top layers: min INT2 (high-level semantics, more robust)
+        Bottom 1/3 layers: min INT8 (feature extraction, sensitive to quantization)
+        Middle 1/3 layers: min INT4
+        Top 1/3 layers: min INT2 (high-level semantics, more robust)
 
         The boundaries shift based on compression_ratio:
           < 4.0: default 1/3 split
@@ -425,21 +426,16 @@ class PrecisionAllocator:
         Returns:
             Minimum Precision allowed for this layer.
         """
-        # Backward compat: no layer info → global INT8 floor (old behavior)
         if num_layers_total <= 0:
             return Precision.INT8
 
-        # Determine boundary fractions based on compression demand
         if compression_ratio > 8.0:
-            # Aggressive: bottom 1/6 INT8, middle INT4, top INT2
             frac_int8 = 1.0 / 6.0
-            frac_int4 = 3.0 / 6.0  # middle 2/6
+            frac_int4 = 3.0 / 6.0
         elif compression_ratio > 4.0:
-            # Tighter: bottom 1/4 INT8, middle INT4, top INT2
             frac_int8 = 0.25
             frac_int4 = 0.50
         else:
-            # Default: bottom 1/3 INT8, middle INT4, top INT2
             frac_int8 = 1.0 / 3.0
             frac_int4 = 2.0 / 3.0
 
